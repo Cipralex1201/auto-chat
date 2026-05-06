@@ -117,46 +117,76 @@ class BotScheduler:
 
             if has_new:
                 saw_new_message = True
-                LOGGER.info("New message detected in thread: %s", snap.thread_url)
+                LOGGER.info(
+                    "New message detected in thread: %s (direction=%s)",
+                    snap.thread_url,
+                    getattr(snap, "latest_direction", "unknown"),
+                )
 
                 handled = False
 
-                if self._looks_like_bot_message(snap.message_text):
-                    LOGGER.info("Skipping reply in thread=%s because latest message looks bot-authored", snap.thread_url)
+                direction = getattr(snap, "latest_direction", "unknown")
+                if direction == "outgoing":
+                    LOGGER.info("Newest message is outgoing; never reply (thread=%s)", snap.thread_url)
                     handled = True
+                elif direction == "unknown":
+                    # Do not reply, and do not advance fingerprint so we retry next poll.
+                    LOGGER.info("Newest message direction unknown; retry next poll (thread=%s)", snap.thread_url)
+                    handled = False
                 else:
-                    first_reply = state.first_reply_sent == 0
-                    delay_sec = self._rand_first_reply_delay() if first_reply else self._rand_followup_reply_delay()
-
-                    if self._should_skip_reply():
-                        # Intentionally do NOT mark as handled; we'll retry next cycle.
-                        LOGGER.info("Skipping immediate reply for this cycle (will retry next poll): %s", snap.thread_url)
+                    # direction == incoming
+                    if self._looks_like_bot_message(snap.message_text):
+                        LOGGER.info(
+                            "Skipping reply in thread=%s because latest message looks bot-authored",
+                            snap.thread_url,
+                        )
+                        handled = True
                     else:
-                        LOGGER.info("Waiting %s sec before reply in thread: %s", delay_sec, snap.thread_url)
-                        time.sleep(delay_sec)
+                        first_reply = state.first_reply_sent == 0
+                        delay_sec = self._rand_first_reply_delay() if first_reply else self._rand_followup_reply_delay()
 
-                        # Ensure we're on the correct thread right before composing/sending.
-                        self._ensure_thread_open(driver, snap.thread_url)
-
-                        reply_text = generate_reply_placeholder(snap.message_text, self.settings.dry_run_reply_text)
-                        if self.settings.enable_sending:
-                            ok = send_message(driver, reply_text)
+                        if self._should_skip_reply():
+                            # Intentionally do NOT mark as handled; we'll retry next cycle.
                             LOGGER.info(
-                                "Send attempted for thread=%s success=%s text=%s",
+                                "Skipping immediate reply for this cycle (will retry next poll): %s",
                                 snap.thread_url,
-                                ok,
-                                reply_text[:120],
                             )
-                            if ok:
+                        else:
+                            LOGGER.info("Waiting %s sec before reply in thread: %s", delay_sec, snap.thread_url)
+                            time.sleep(delay_sec)
+
+                            # Ensure we're on the correct thread right before composing/sending.
+                            self._ensure_thread_open(driver, snap.thread_url)
+
+                            reply_text = generate_reply_placeholder(snap.message_text, self.settings.dry_run_reply_text)
+                            if self.settings.enable_sending:
+                                ok = False
+                                max_attempts = 3  # 2 retries + initial attempt
+                                for attempt in range(1, max_attempts + 1):
+                                    if attempt > 1:
+                                        time.sleep(0.5)
+                                    ok = send_message(driver, reply_text)
+                                    LOGGER.info(
+                                        "Send attempted for thread=%s attempt=%d/%d success=%s text=%s",
+                                        snap.thread_url,
+                                        attempt,
+                                        max_attempts,
+                                        ok,
+                                        reply_text[:120],
+                                    )
+                                    if ok:
+                                        break
+
+                                if ok:
+                                    handled = True
+                                    state.first_reply_sent = 1
+                                else:
+                                    handled = False
+                                    LOGGER.warning("Send failed; will retry next poll (thread=%s)", snap.thread_url)
+                            else:
+                                LOGGER.info("DRY RUN reply for thread=%s text=%s", snap.thread_url, reply_text)
                                 handled = True
                                 state.first_reply_sent = 1
-                            else:
-                                handled = False
-                                LOGGER.warning("Send failed; will retry next poll (thread=%s)", snap.thread_url)
-                        else:
-                            LOGGER.info("DRY RUN reply for thread=%s text=%s", snap.thread_url, reply_text)
-                            handled = True
-                            state.first_reply_sent = 1
 
                 if handled:
                     self.store.upsert_thread_state(
