@@ -98,6 +98,22 @@ class BotScheduler:
     def _handle_snapshots(self, driver, snapshots: list[ThreadSnapshot]) -> None:
         saw_new_message = False
 
+        def now_utc_iso() -> str:
+            return datetime.now(timezone.utc).isoformat()
+
+        def parse_iso(ts: str | None) -> datetime | None:
+            if not ts:
+                return None
+            try:
+                return datetime.fromisoformat(ts)
+            except Exception:  # noqa: BLE001
+                return None
+
+        # Guardrails against accidental spam on DOM bounces.
+        min_reply_gap_sec = 2
+        attempt_backoff_sec = 10
+        max_attempts_per_inbound = 3
+
         for snap in snapshots:
             state = self.store.get_thread_state(snap.thread_url)
 
@@ -115,106 +131,149 @@ class BotScheduler:
                 has_new,
             )
 
-            if has_new:
-                saw_new_message = True
-                LOGGER.info(
-                    "New message detected in thread: %s (direction=%s)",
-                    snap.thread_url,
-                    getattr(snap, "latest_direction", "unknown"),
-                )
+            # Always persist the latest observed fingerprint/text for diagnostics.
+            # This must NOT control deduplication of replies.
+            self.store.upsert_thread_state(
+                thread_url=snap.thread_url,
+                last_seen_fingerprint=snap.message_fingerprint,
+                last_seen_text=snap.message_text,
+                last_activity_utc=snap.observed_at_utc,
+                first_reply_sent=state.first_reply_sent,
+                last_replied_incoming_fingerprint=state.last_replied_incoming_fingerprint,
+                last_replied_incoming_text=state.last_replied_incoming_text,
+                last_reply_utc=state.last_reply_utc,
+                last_attempt_incoming_fingerprint=state.last_attempt_incoming_fingerprint,
+                last_attempt_utc=state.last_attempt_utc,
+                attempt_count=state.attempt_count,
+            )
 
-                handled = False
+            incoming_fp = getattr(snap, "latest_incoming_fingerprint", None)
+            incoming_text = getattr(snap, "latest_incoming_text", None) or ""
 
-                direction = getattr(snap, "latest_direction", "unknown")
-                if direction == "outgoing":
-                    LOGGER.info("Newest message is outgoing; never reply (thread=%s)", snap.thread_url)
-                    handled = True
-                elif direction == "unknown":
-                    # Do not reply, and do not advance fingerprint so we retry next poll.
-                    LOGGER.info("Newest message direction unknown; retry next poll (thread=%s)", snap.thread_url)
-                    handled = False
-                else:
-                    # direction == incoming
-                    if self._looks_like_bot_message(snap.message_text):
-                        LOGGER.info(
-                            "Skipping reply in thread=%s because latest message looks bot-authored",
-                            snap.thread_url,
-                        )
-                        handled = True
-                    else:
-                        first_reply = state.first_reply_sent == 0
-                        delay_sec = self._rand_first_reply_delay() if first_reply else self._rand_followup_reply_delay()
+            if not incoming_fp:
+                LOGGER.debug("No incoming candidate found; no reply (thread=%s)", snap.thread_url)
+                continue
 
-                        if self._should_skip_reply():
-                            # Intentionally do NOT mark as handled; we'll retry next cycle.
-                            LOGGER.info(
-                                "Skipping immediate reply for this cycle (will retry next poll): %s",
-                                snap.thread_url,
-                            )
-                        else:
-                            LOGGER.info("Waiting %s sec before reply in thread: %s", delay_sec, snap.thread_url)
-                            time.sleep(delay_sec)
+            if state.last_replied_incoming_fingerprint == incoming_fp:
+                LOGGER.debug("Incoming already replied-to; no reply (thread=%s)", snap.thread_url)
+                continue
 
-                            # Ensure we're on the correct thread right before composing/sending.
-                            self._ensure_thread_open(driver, snap.thread_url)
-
-                            reply_text = generate_reply_placeholder(snap.message_text, self.settings.dry_run_reply_text)
-                            if self.settings.enable_sending:
-                                ok = False
-                                max_attempts = 3  # 2 retries + initial attempt
-                                for attempt in range(1, max_attempts + 1):
-                                    if attempt > 1:
-                                        time.sleep(0.5)
-                                    ok = send_message(driver, reply_text)
-                                    LOGGER.info(
-                                        "Send attempted for thread=%s attempt=%d/%d success=%s text=%s",
-                                        snap.thread_url,
-                                        attempt,
-                                        max_attempts,
-                                        ok,
-                                        reply_text[:120],
-                                    )
-                                    if ok:
-                                        break
-
-                                if ok:
-                                    handled = True
-                                    state.first_reply_sent = 1
-                                else:
-                                    handled = False
-                                    LOGGER.warning("Send failed; will retry next poll (thread=%s)", snap.thread_url)
-                            else:
-                                LOGGER.info("DRY RUN reply for thread=%s text=%s", snap.thread_url, reply_text)
-                                handled = True
-                                state.first_reply_sent = 1
-
-                if handled:
-                    self.store.upsert_thread_state(
-                        thread_url=snap.thread_url,
-                        last_seen_fingerprint=snap.message_fingerprint,
-                        last_seen_text=snap.message_text,
-                        last_activity_utc=snap.observed_at_utc,
-                        first_reply_sent=state.first_reply_sent,
-                    )
-                else:
-                    # Leave the previous fingerprint intact so the same inbound message
-                    # remains "new" and we will retry on the next poll.
-                    self.store.upsert_thread_state(
-                        thread_url=snap.thread_url,
-                        last_seen_fingerprint=state.last_seen_fingerprint,
-                        last_seen_text=state.last_seen_text,
-                        last_activity_utc=state.last_activity_utc,
-                        first_reply_sent=state.first_reply_sent,
-                    )
-            else:
-                # Keep state stable when no actual new message was detected.
+            if self._looks_like_bot_message(incoming_text):
+                LOGGER.info("Skipping: latest incoming looks bot-authored (thread=%s)", snap.thread_url)
+                # Mark as replied-to so we don't loop on our own message echoes.
                 self.store.upsert_thread_state(
                     thread_url=snap.thread_url,
-                    last_seen_fingerprint=state.last_seen_fingerprint,
-                    last_seen_text=state.last_seen_text,
-                    last_activity_utc=state.last_activity_utc,
+                    last_seen_fingerprint=snap.message_fingerprint,
+                    last_seen_text=snap.message_text,
+                    last_activity_utc=snap.observed_at_utc,
                     first_reply_sent=state.first_reply_sent,
+                    last_replied_incoming_fingerprint=incoming_fp,
+                    last_replied_incoming_text=incoming_text,
+                    last_reply_utc=state.last_reply_utc,
+                    last_attempt_incoming_fingerprint=None,
+                    last_attempt_utc=None,
+                    attempt_count=0,
                 )
+                continue
+
+            # Minimum gap between replies per thread.
+            last_reply_dt = parse_iso(state.last_reply_utc)
+            if last_reply_dt is not None:
+                gap = (datetime.now(timezone.utc) - last_reply_dt).total_seconds()
+                if gap < float(min_reply_gap_sec):
+                    LOGGER.info(
+                        "Reply gap guard: last reply %.1fs ago; delaying (thread=%s)",
+                        gap,
+                        snap.thread_url,
+                    )
+                    continue
+
+            # Attempt backoff / attempt limit per inbound.
+            if state.last_attempt_incoming_fingerprint == incoming_fp:
+                last_attempt_dt = parse_iso(state.last_attempt_utc)
+                if state.attempt_count >= max_attempts_per_inbound:
+                    LOGGER.warning(
+                        "Max attempts reached for inbound; suppressing further retries (thread=%s)",
+                        snap.thread_url,
+                    )
+                    continue
+                if last_attempt_dt is not None:
+                    since = (datetime.now(timezone.utc) - last_attempt_dt).total_seconds()
+                    if since < float(attempt_backoff_sec):
+                        LOGGER.info(
+                            "Backoff active (%.1fs < %ss); retry later (thread=%s)",
+                            since,
+                            attempt_backoff_sec,
+                            snap.thread_url,
+                        )
+                        continue
+
+            saw_new_message = True
+            LOGGER.info(
+                "New incoming to reply (thread=%s latest_dir=%s)",
+                snap.thread_url,
+                getattr(snap, "latest_direction", "unknown"),
+            )
+
+            first_reply = state.first_reply_sent == 0
+            delay_sec = self._rand_first_reply_delay() if first_reply else self._rand_followup_reply_delay()
+
+            if self._should_skip_reply():
+                LOGGER.info("Skipping immediate reply this cycle (thread=%s)", snap.thread_url)
+                continue
+
+            # Record attempt before sleeping/sending to reduce chance of rapid duplicates.
+            attempt_count = state.attempt_count + 1 if state.last_attempt_incoming_fingerprint == incoming_fp else 1
+            self.store.upsert_thread_state(
+                thread_url=snap.thread_url,
+                last_seen_fingerprint=snap.message_fingerprint,
+                last_seen_text=snap.message_text,
+                last_activity_utc=snap.observed_at_utc,
+                first_reply_sent=state.first_reply_sent,
+                last_replied_incoming_fingerprint=state.last_replied_incoming_fingerprint,
+                last_replied_incoming_text=state.last_replied_incoming_text,
+                last_reply_utc=state.last_reply_utc,
+                last_attempt_incoming_fingerprint=incoming_fp,
+                last_attempt_utc=now_utc_iso(),
+                attempt_count=attempt_count,
+            )
+
+            LOGGER.info("Waiting %s sec before reply in thread: %s", delay_sec, snap.thread_url)
+            time.sleep(delay_sec)
+
+            self._ensure_thread_open(driver, snap.thread_url)
+            reply_text = generate_reply_placeholder(incoming_text, self.settings.dry_run_reply_text)
+
+            if self.settings.enable_sending:
+                ok = send_message(driver, reply_text)
+                LOGGER.info(
+                    "Send attempted for thread=%s success=%s text=%s",
+                    snap.thread_url,
+                    ok,
+                    reply_text[:120],
+                )
+                if not ok:
+                    LOGGER.warning("Send failed; will retry later (thread=%s)", snap.thread_url)
+                    continue
+            else:
+                LOGGER.info("DRY RUN reply for thread=%s text=%s", snap.thread_url, reply_text)
+
+            # Mark inbound as replied-to. Even if Instagram UI bounces, this prevents re-reply spam.
+            state.first_reply_sent = 1
+            replied_at = now_utc_iso()
+            self.store.upsert_thread_state(
+                thread_url=snap.thread_url,
+                last_seen_fingerprint=snap.message_fingerprint,
+                last_seen_text=snap.message_text,
+                last_activity_utc=snap.observed_at_utc,
+                first_reply_sent=state.first_reply_sent,
+                last_replied_incoming_fingerprint=incoming_fp,
+                last_replied_incoming_text=incoming_text,
+                last_reply_utc=replied_at,
+                last_attempt_incoming_fingerprint=None,
+                last_attempt_utc=None,
+                attempt_count=0,
+            )
 
         if saw_new_message:
             self.mode_state.last_activity_monotonic = time.monotonic()

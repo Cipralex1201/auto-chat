@@ -23,9 +23,19 @@ MAIN_CONTAINER_XPATH = "(//main | //*[@role='main'])[1]"
 @dataclass(frozen=True)
 class ThreadSnapshot:
     thread_url: str
+    # Fingerprint of the observed tail window of messages (diagnostic / change detection).
     message_fingerprint: str
+
+    # Best-effort latest bubble info (kept for backward compatibility).
     message_text: str
     latest_direction: str  # incoming | outgoing | unknown
+
+    # Stable dedupe key for the most recent incoming message in the observed tail window.
+    latest_incoming_fingerprint: str | None
+    latest_incoming_text: str | None
+
+    # For optional send verification/debug.
+    latest_outgoing_text: str | None
     observed_at_utc: str
 
 
@@ -50,6 +60,16 @@ def _is_ignored_text(text: str) -> bool:
         "message",
     }
     if lowered in ignored_exact:
+        return True
+
+    # Unicode ellipsis / locale variants.
+    if lowered in {"typing…", "typing..", "typing."}:
+        return True
+    if lowered.startswith("typing") and ("..." in lowered or "…" in lowered) and len(lowered) <= 20:
+        return True
+    # Hungarian / common localizations (best-effort).
+    # Examples: "gépel...", "gépel…"
+    if lowered.startswith("gépel") and ("..." in lowered or "…" in lowered) and len(lowered) <= 20:
         return True
     if lowered.startswith("seen") and len(lowered) <= 25:
         return True
@@ -232,6 +252,128 @@ def _extract_latest_message(driver) -> tuple[str, str]:
     return "", "unknown"
 
 
+def _normalize_text(text: str) -> str:
+    return " ".join((text or "").strip().split())
+
+
+def _fingerprint_parts(parts: list[tuple[str, str]]) -> str:
+    payload = "\n".join([f"{d}\t{t}" for d, t in parts])
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[str, str, float]]]:
+    """Return (best_effort_latest_direction, candidates) where candidates are (direction, text, bottom).
+
+    Candidates are deduped per-bubble using a coarse (text,bottom) key to avoid duplicate spans,
+    but still allow repeated identical messages if they appear at different vertical positions.
+    """
+
+    try:
+        main = driver.find_element(By.XPATH, MAIN_CONTAINER_XPATH)
+        main_rect = main.rect
+        main_mid_x = float(main_rect.get("x", 0.0)) + float(main_rect.get("width", 0.0)) / 2.0
+    except Exception:  # noqa: BLE001
+        main_mid_x = 0.0
+
+    row_xpath = f"{MAIN_CONTAINER_XPATH}//*[@role='row']"
+    listitem_xpath = f"{MAIN_CONTAINER_XPATH}//*[@role='listitem']"
+    bubble_xpath = (
+        ".//*[@dir='auto' or @dir='ltr'][normalize-space() and not(ancestor::*[@role='textbox'])]"
+        " | .//span[normalize-space() and not(ancestor::*[@role='textbox'])]"
+    )
+    fallback_xpaths = [
+        f"{MAIN_CONTAINER_XPATH}//*[@dir='auto' and normalize-space() and not(ancestor::*[@role='textbox'])]",
+        f"{MAIN_CONTAINER_XPATH}//*[@dir='ltr' and normalize-space() and not(ancestor::*[@role='textbox'])]",
+        f"{MAIN_CONTAINER_XPATH}//span[normalize-space() and not(ancestor::*[@role='textbox'])]",
+    ]
+
+    raw: list[tuple[str, str, float]] = []
+
+    def add_candidate(text: str, rect: dict) -> None:
+        norm = _normalize_text(text)
+        if not norm or _is_ignored_text(norm):
+            return
+        bottom = float(rect.get("y", 0.0)) + float(rect.get("height", 0.0))
+        direction = _classify_direction(main_mid_x, rect)
+        raw.append((direction, norm, bottom))
+
+    for attempt in range(2):
+        raw.clear()
+
+        try:
+            rows = driver.find_elements(By.XPATH, row_xpath)
+        except Exception:  # noqa: BLE001
+            rows = []
+
+        try:
+            listitems = driver.find_elements(By.XPATH, listitem_xpath)
+        except Exception:  # noqa: BLE001
+            listitems = []
+
+        for row in rows:
+            try:
+                bubbles = row.find_elements(By.XPATH, bubble_xpath)
+            except Exception:  # noqa: BLE001
+                continue
+            for el in bubbles:
+                text = _safe_text(el)
+                if text is None:
+                    continue
+                rect = _safe_rect(el)
+                if rect is None:
+                    continue
+                add_candidate(text, rect)
+
+        if not raw:
+            for item in listitems:
+                try:
+                    bubbles = item.find_elements(By.XPATH, bubble_xpath)
+                except Exception:  # noqa: BLE001
+                    continue
+                for el in bubbles:
+                    text = _safe_text(el)
+                    if text is None:
+                        continue
+                    rect = _safe_rect(el)
+                    if rect is None:
+                        continue
+                    add_candidate(text, rect)
+
+        if not raw:
+            for xpath in fallback_xpaths:
+                try:
+                    elements = driver.find_elements(By.XPATH, xpath)
+                except Exception:  # noqa: BLE001
+                    elements = []
+                for el in elements:
+                    text = _safe_text(el)
+                    if text is None:
+                        continue
+                    rect = _safe_rect(el)
+                    if rect is None:
+                        continue
+                    add_candidate(text, rect)
+
+        if raw:
+            # Deduplicate likely duplicates from nested spans: coarse bucket by (direction,text,bottom_bucket)
+            seen_keys: set[tuple[str, str, int]] = set()
+            deduped: list[tuple[str, str, float]] = []
+            for direction, text, bottom in sorted(raw, key=lambda t: t[2]):
+                key = (direction, text.lower(), int(bottom // 6))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                deduped.append((direction, text, bottom))
+
+            tail = deduped[-window_size:]
+            latest_direction = tail[-1][0] if tail else "unknown"
+            return latest_direction, tail
+
+        time.sleep(0.15)
+
+    return "unknown", []
+
+
 def read_thread_snapshot(driver, thread_url: str) -> ThreadSnapshot:
     current_url = (driver.current_url or "").lower()
     normalized_target = thread_url.lower().rstrip("/")
@@ -248,10 +390,10 @@ def read_thread_snapshot(driver, thread_url: str) -> ThreadSnapshot:
 
     # One short grace delay helps dynamic content settle after thread load.
     time.sleep(1.0)
-    latest_text, latest_direction = _extract_latest_message(driver)
+    latest_direction, tail = _extract_tail_window(driver)
 
     # Retry once if extraction was empty to avoid false EMPTY cycles.
-    if not latest_text:
+    if not tail:
         LOGGER.debug("Empty extraction on first attempt, retrying once")
         try:
             driver.refresh()
@@ -259,16 +401,42 @@ def read_thread_snapshot(driver, thread_url: str) -> ThreadSnapshot:
         except TimeoutException:
             LOGGER.warning("Retry refresh timed out for thread: %s", thread_url)
         time.sleep(1.0)
-        latest_text, latest_direction = _extract_latest_message(driver)
+        latest_direction, tail = _extract_tail_window(driver)
 
     observed_at = datetime.now(timezone.utc).isoformat()
 
-    if latest_text:
-        content_hash = hashlib.sha256(f"{latest_direction}\n{latest_text}".encode()).hexdigest()[:16]
-        fingerprint = f"msg:{latest_direction}:{content_hash}"
+    latest_text: str = tail[-1][1] if tail else ""
+
+    if tail:
+        parts = [(d, t) for d, t, _ in tail]
+        observed_hash = _fingerprint_parts(parts)
+        fingerprint = f"win:{observed_hash}"
+
+        latest_incoming_fingerprint: str | None = None
+        latest_incoming_text: str | None = None
+        latest_outgoing_text: str | None = None
+
+        last_in_idx: int | None = None
+        last_out_idx: int | None = None
+        for idx, (d, t, _bottom) in enumerate(tail):
+            if d == "incoming":
+                last_in_idx = idx
+            elif d == "outgoing":
+                last_out_idx = idx
+
+        if last_in_idx is not None:
+            incoming_parts = parts[: last_in_idx + 1]
+            latest_incoming_fingerprint = f"in:{_fingerprint_parts(incoming_parts)}"
+            latest_incoming_text = tail[last_in_idx][1]
+
+        if last_out_idx is not None:
+            latest_outgoing_text = tail[last_out_idx][1]
     else:
         fingerprint = "EMPTY"
         latest_direction = "unknown"
+        latest_incoming_fingerprint = None
+        latest_incoming_text = None
+        latest_outgoing_text = None
         LOGGER.warning(
             "No message text extracted after retry. url=%s current_url=%s title=%s",
             thread_url,
@@ -276,12 +444,22 @@ def read_thread_snapshot(driver, thread_url: str) -> ThreadSnapshot:
             driver.title,
         )
 
-    LOGGER.debug("Thread snapshot: url=%s fingerprint=%s text_len=%d", thread_url, fingerprint, len(latest_text))
+    LOGGER.debug(
+        "Thread snapshot: url=%s fp=%s latest_dir=%s tail=%d latest_in_fp=%s",
+        thread_url,
+        fingerprint,
+        latest_direction,
+        len(tail),
+        latest_incoming_fingerprint,
+    )
     return ThreadSnapshot(
         thread_url=thread_url,
         message_fingerprint=fingerprint,
         message_text=latest_text,
         latest_direction=latest_direction,
+        latest_incoming_fingerprint=latest_incoming_fingerprint,
+        latest_incoming_text=latest_incoming_text,
+        latest_outgoing_text=latest_outgoing_text,
         observed_at_utc=observed_at,
     )
 
