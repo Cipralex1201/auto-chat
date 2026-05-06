@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,6 +54,15 @@ def _is_ignored_text(text: str) -> bool:
     if lowered.startswith("seen") and len(lowered) <= 25:
         return True
 
+    # Common timestamp / age labels in the message list that are not actual messages.
+    # Examples observed: "17w", and sometimes HH:MM.
+    if re.fullmatch(r"\d{1,3}[smhdw]", lowered):
+        return True
+    if re.fullmatch(r"\d{1,2}:\d{2}", lowered):
+        return True
+    if re.fullmatch(r"\d{1,3}\s*(sec|secs|second|seconds|min|mins|minute|minutes|hr|hrs|hour|hours|day|days|week|weeks)", lowered):
+        return True
+
     # Keep short real messages too (e.g., "ok"), but drop isolated UI glyph-like chars.
     if len(normalized) == 1 and not normalized.isalnum():
         return True
@@ -102,8 +112,9 @@ def _extract_latest_message(driver) -> tuple[str, str]:
     except Exception:  # noqa: BLE001
         main_mid_x = 0.0
 
-    # Prefer scanning message rows first; fall back to a broader scan if none match.
+    # Prefer scanning message rows/list items first; fall back to a broader scan if none match.
     row_xpath = f"{MAIN_CONTAINER_XPATH}//*[@role='row']"
+    listitem_xpath = f"{MAIN_CONTAINER_XPATH}//*[@role='listitem']"
     bubble_xpath = (
         ".//*[@dir='auto' or @dir='ltr'][normalize-space() and not(ancestor::*[@role='textbox'])]"
         " | .//span[normalize-space() and not(ancestor::*[@role='textbox'])]"
@@ -126,7 +137,17 @@ def _extract_latest_message(driver) -> tuple[str, str]:
         except Exception:  # noqa: BLE001
             rows = []
 
-        LOGGER.debug("Row selector matched %d elements (attempt=%d)", len(rows), attempt + 1)
+        try:
+            listitems = driver.find_elements(By.XPATH, listitem_xpath)
+        except Exception:  # noqa: BLE001
+            listitems = []
+
+        LOGGER.debug(
+            "Container selectors matched rows=%d listitems=%d (attempt=%d)",
+            len(rows),
+            len(listitems),
+            attempt + 1,
+        )
 
         def consider_candidate(text: str, rect: dict) -> None:
             nonlocal best_text, best_rect, best_bottom
@@ -158,6 +179,25 @@ def _extract_latest_message(driver) -> tuple[str, str]:
                 if rect is None:
                     continue
                 consider_candidate(text, rect)
+
+        # Pass 1b: listitem-based scan (common alternative to role=row)
+        if not best_text:
+            for item in listitems:
+                try:
+                    bubbles = item.find_elements(By.XPATH, bubble_xpath)
+                except StaleElementReferenceException:
+                    continue
+                except Exception:  # noqa: BLE001
+                    continue
+
+                for el in bubbles:
+                    text = _safe_text(el)
+                    if text is None or _is_ignored_text(text):
+                        continue
+                    rect = _safe_rect(el)
+                    if rect is None:
+                        continue
+                    consider_candidate(text, rect)
 
         # Pass 2: broader fallback scan (in case role='row' isn't present)
         if not best_text:
