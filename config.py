@@ -14,7 +14,7 @@ class Settings:
     watched_threads: list[str]
 
     firefox_profile_dir: Path
-    geckodriver_path: Path
+    geckodriver_path: Path | None
     headless: bool
     page_load_timeout_sec: int
 
@@ -39,6 +39,7 @@ class Settings:
     dry_run_reply_text: str
 
     log_level: str
+    log_file: Path | None
 
 
 def _get_bool(name: str, default: str = "false") -> bool:
@@ -65,6 +66,15 @@ def _parse_threads(raw: str | None) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _parse_optional_path(raw: str | None) -> Path | None:
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    return Path(stripped).expanduser()
+
+
 def load_settings() -> Settings:
     load_dotenv()
 
@@ -73,7 +83,7 @@ def load_settings() -> Settings:
         ig_password=os.getenv("IG_PASSWORD", "").strip(),
         watched_threads=_parse_threads(os.getenv("INSTAGRAM_WATCHED_THREADS")),
         firefox_profile_dir=Path(os.getenv("FIREFOX_PROFILE_DIR", "./firefox-profile")).expanduser(),
-        geckodriver_path=Path(os.getenv("GECKODRIVER_PATH", "geckodriver")).expanduser(),
+        geckodriver_path=_parse_optional_path(os.getenv("GECKODRIVER_PATH")),
         headless=_get_bool("HEADLESS", "false"),
         page_load_timeout_sec=_get_int("PAGE_LOAD_TIMEOUT_SEC", 30),
         idle_min_sec=_get_int("IDLE_MIN_SEC", 120),
@@ -92,6 +102,7 @@ def load_settings() -> Settings:
         skip_reply_probability=_get_float("SKIP_REPLY_PROBABILITY", 0.20),
         dry_run_reply_text=os.getenv("DRY_RUN_REPLY_TEXT", "Thanks! I saw your message.").strip(),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+        log_file=_parse_optional_path(os.getenv("LOG_FILE", "./logs/bot.log")),
     )
 
     if settings.idle_min_sec > settings.idle_max_sec:

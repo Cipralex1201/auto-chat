@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from typing import Final
 
-from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 
 LOGGER = logging.getLogger(__name__)
@@ -13,17 +12,21 @@ INSTAGRAM_LOGIN: Final[str] = "https://www.instagram.com/accounts/login/"
 
 
 def is_logged_in(driver) -> bool:
+    # Check session without navigating away from current page.
     try:
-        driver.get(INSTAGRAM_HOME)
-    except TimeoutException:
-        LOGGER.warning("Timeout while opening Instagram home, continuing with URL checks")
+        current = (driver.current_url or "").lower()
+    except Exception:  # noqa: BLE001
+        LOGGER.warning("Could not get current URL, assuming not logged in")
+        return False
 
-    current = (driver.current_url or "").lower()
     if "/accounts/login" in current:
+        LOGGER.debug("Currently on login page, not logged in")
         return False
 
     login_inputs = driver.find_elements(By.NAME, "username")
-    return len(login_inputs) == 0
+    is_logged_in_result = len(login_inputs) == 0
+    LOGGER.debug("Session check: logged_in=%s (found %d login fields)", is_logged_in_result, len(login_inputs))
+    return is_logged_in_result
 
 
 def login_if_needed(driver, username: str, password: str) -> None:

@@ -25,8 +25,10 @@ LLM prompt assembly/integration is intentionally left for a later phase.
 
 1. Create virtual environment and install dependencies.
 2. Copy `.env.example` to `.env` and fill values.
-3. Ensure Firefox and geckodriver are installed.
-4. Create/use a dedicated Firefox profile path for `FIREFOX_PROFILE_DIR`.
+3. Ensure Firefox is installed.
+4. If geckodriver is on PATH (or Selenium Manager can resolve it), leave `GECKODRIVER_PATH` empty.
+5. Set `GECKODRIVER_PATH` only when you want an explicit pinned binary override.
+6. Create/use a dedicated Firefox profile path for `FIREFOX_PROFILE_DIR`.
 
 ## Run
 

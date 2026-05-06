@@ -30,8 +30,12 @@ class BrowserManager:
         if self.settings.headless:
             options.add_argument("-headless")
 
-        service = FirefoxService(executable_path=str(self.settings.geckodriver_path))
-        driver = webdriver.Firefox(service=service, options=options)
+        if self.settings.geckodriver_path is not None:
+            service = FirefoxService(executable_path=str(self.settings.geckodriver_path))
+            driver = webdriver.Firefox(service=service, options=options)
+        else:
+            # Let Selenium Manager / system PATH resolve geckodriver automatically.
+            driver = webdriver.Firefox(options=options)
         driver.set_page_load_timeout(self.settings.page_load_timeout_sec)
         return driver
 

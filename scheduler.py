@@ -14,6 +14,11 @@ from sender import send_message
 from session import login_if_needed
 from state_store import StateStore
 
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -50,6 +55,29 @@ class BotScheduler:
     def _should_skip_reply(self) -> bool:
         return random.random() < self.settings.skip_reply_probability
 
+    def _looks_like_bot_message(self, text: str) -> bool:
+        normalized = text.strip().lower()
+        if not normalized:
+            return False
+        if normalized.startswith("auto-reply placeholder:"):
+            return True
+        if normalized == self.settings.dry_run_reply_text.strip().lower():
+            return True
+        return False
+
+    def _ensure_thread_open(self, driver, thread_url: str, timeout_sec: int = 10) -> None:
+        current_url = (driver.current_url or "").lower().rstrip("/")
+        target = (thread_url or "").lower().rstrip("/")
+        if target and target not in current_url:
+            LOGGER.debug("Navigating to thread before sending: %s", thread_url)
+            driver.get(thread_url)
+        try:
+            WebDriverWait(driver, timeout_sec).until(
+                EC.presence_of_element_located((By.XPATH, "(//main | //*[@role='main'])[1]"))
+            )
+        except TimeoutException:
+            LOGGER.warning("Thread main area did not become ready in time before sending: %s", thread_url)
+
     def _enter_active_mode(self) -> None:
         self.mode_state.mode = "active"
         self.mode_state.last_new_message_monotonic = time.monotonic()
@@ -72,36 +100,84 @@ class BotScheduler:
 
         for snap in snapshots:
             state = self.store.get_thread_state(snap.thread_url)
+
+            if snap.message_fingerprint == "EMPTY":
+                LOGGER.warning("Skipping thread %s this cycle: extraction returned EMPTY", snap.thread_url)
+                continue
+
             has_new = state.last_seen_fingerprint != snap.message_fingerprint
+            LOGGER.debug(
+                "Thread %s: prev_fp=%s new_fp=%s text_len=%d has_new=%s",
+                snap.thread_url,
+                state.last_seen_fingerprint,
+                snap.message_fingerprint,
+                len(snap.message_text),
+                has_new,
+            )
 
             if has_new:
                 saw_new_message = True
-                LOGGER.info("New message observed in thread: %s", snap.thread_url)
+                LOGGER.info("New message detected in thread: %s", snap.thread_url)
 
-                first_reply = state.first_reply_sent == 0
-                delay_sec = self._rand_first_reply_delay() if first_reply else self._rand_followup_reply_delay()
+                handled = False
 
-                if self._should_skip_reply():
-                    LOGGER.info("Skipping immediate reply for this cycle: %s", snap.thread_url)
+                if self._looks_like_bot_message(snap.message_text):
+                    LOGGER.info("Skipping reply in thread=%s because latest message looks bot-authored", snap.thread_url)
+                    handled = True
                 else:
-                    LOGGER.info("Waiting %s sec before reply in thread: %s", delay_sec, snap.thread_url)
-                    time.sleep(delay_sec)
-                    reply_text = generate_reply_placeholder(snap.message_text, self.settings.dry_run_reply_text)
-                    if self.settings.enable_sending:
-                        ok = send_message(driver, reply_text)
-                        LOGGER.info("Send attempted for thread=%s success=%s", snap.thread_url, ok)
-                    else:
-                        LOGGER.info("DRY RUN reply for thread=%s text=%s", snap.thread_url, reply_text)
-                    state.first_reply_sent = 1
+                    first_reply = state.first_reply_sent == 0
+                    delay_sec = self._rand_first_reply_delay() if first_reply else self._rand_followup_reply_delay()
 
-                self.store.upsert_thread_state(
-                    thread_url=snap.thread_url,
-                    last_seen_fingerprint=snap.message_fingerprint,
-                    last_seen_text=snap.message_text,
-                    last_activity_utc=snap.observed_at_utc,
-                    first_reply_sent=state.first_reply_sent,
-                )
+                    if self._should_skip_reply():
+                        # Intentionally do NOT mark as handled; we'll retry next cycle.
+                        LOGGER.info("Skipping immediate reply for this cycle (will retry next poll): %s", snap.thread_url)
+                    else:
+                        LOGGER.info("Waiting %s sec before reply in thread: %s", delay_sec, snap.thread_url)
+                        time.sleep(delay_sec)
+
+                        # Ensure we're on the correct thread right before composing/sending.
+                        self._ensure_thread_open(driver, snap.thread_url)
+
+                        reply_text = generate_reply_placeholder(snap.message_text, self.settings.dry_run_reply_text)
+                        if self.settings.enable_sending:
+                            ok = send_message(driver, reply_text)
+                            LOGGER.info(
+                                "Send attempted for thread=%s success=%s text=%s",
+                                snap.thread_url,
+                                ok,
+                                reply_text[:120],
+                            )
+                            if ok:
+                                handled = True
+                                state.first_reply_sent = 1
+                            else:
+                                handled = False
+                                LOGGER.warning("Send failed; will retry next poll (thread=%s)", snap.thread_url)
+                        else:
+                            LOGGER.info("DRY RUN reply for thread=%s text=%s", snap.thread_url, reply_text)
+                            handled = True
+                            state.first_reply_sent = 1
+
+                if handled:
+                    self.store.upsert_thread_state(
+                        thread_url=snap.thread_url,
+                        last_seen_fingerprint=snap.message_fingerprint,
+                        last_seen_text=snap.message_text,
+                        last_activity_utc=snap.observed_at_utc,
+                        first_reply_sent=state.first_reply_sent,
+                    )
+                else:
+                    # Leave the previous fingerprint intact so the same inbound message
+                    # remains "new" and we will retry on the next poll.
+                    self.store.upsert_thread_state(
+                        thread_url=snap.thread_url,
+                        last_seen_fingerprint=state.last_seen_fingerprint,
+                        last_seen_text=state.last_seen_text,
+                        last_activity_utc=state.last_activity_utc,
+                        first_reply_sent=state.first_reply_sent,
+                    )
             else:
+                # Keep state stable when no actual new message was detected.
                 self.store.upsert_thread_state(
                     thread_url=snap.thread_url,
                     last_seen_fingerprint=state.last_seen_fingerprint,
@@ -136,6 +212,7 @@ class BotScheduler:
             return
 
         if self.mode_state.last_activity_monotonic is None:
+            LOGGER.info("Idle mode with no recent activity, closing browser")
             self.browser.close()
             return
 
