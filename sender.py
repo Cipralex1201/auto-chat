@@ -29,8 +29,14 @@ def send_message(driver, text: str) -> bool:
         "//textarea",
     ]
 
-    wait = WebDriverWait(driver, 10)
+    wait = WebDriverWait(driver, 15)
     last_error: Exception | None = None
+
+    # Close any open pickers/popovers that can steal focus.
+    try:
+        driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+    except Exception:  # noqa: BLE001
+        pass
 
     def _read_composer_text(el) -> str:
         try:
@@ -42,75 +48,185 @@ def send_message(driver, text: str) -> bool:
     def _normalize(s: str) -> str:
         return " ".join((s or "").strip().split()).lower()
 
-    def _js_set_composer_text(el, message_text: str) -> None:
+    def _describe_el(el) -> dict:
+        info: dict = {}
+        try:
+            info["tag"] = (el.tag_name or "").lower()
+        except Exception:  # noqa: BLE001
+            info["tag"] = ""
+        for attr in ("role", "contenteditable", "aria-label"):
+            try:
+                info[attr] = (el.get_attribute(attr) or "")
+            except Exception:  # noqa: BLE001
+                info[attr] = ""
+        try:
+            r = el.rect
+            info["rect"] = {"x": r.get("x"), "y": r.get("y"), "w": r.get("width"), "h": r.get("height")}
+        except Exception:  # noqa: BLE001
+            info["rect"] = {}
+        try:
+            info["text"] = _read_composer_text(el)[:40]
+        except Exception:  # noqa: BLE001
+            info["text"] = ""
+        return info
+
+    def _dump_candidates(prefix: str, elements: list) -> None:
+        sample = elements[:3]
+        details = []
+        for el in sample:
+            try:
+                details.append(_describe_el(el))
+            except Exception:  # noqa: BLE001
+                details.append({"error": "describe_failed"})
+        try:
+            active = driver.switch_to.active_element
+            active_info = _describe_el(active)
+        except Exception:  # noqa: BLE001
+            active_info = {"error": "active_failed"}
+        LOGGER.debug("%s candidates=%s active=%s", prefix, details, active_info)
+
+    def _focus(el) -> None:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'nearest'});", el)
+        except Exception:  # noqa: BLE001
+            pass
+        ActionChains(driver).move_to_element(el).click(el).perform()
+        time.sleep(0.08)
+
+    def _resolve_edit_target(el):
+        # Instagram sometimes nests the actual editable inside a role=textbox container.
+        try:
+            tag = (el.tag_name or "").lower()
+        except Exception:  # noqa: BLE001
+            tag = ""
+        if tag == "textarea":
+            return el
+        try:
+            ce = (el.get_attribute("contenteditable") or "").strip().lower()
+            if ce in {"true", ""}:
+                return el
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            nested = el.find_elements(By.XPATH, ".//*[@contenteditable='true' or @contenteditable='']")
+            if nested:
+                return nested[-1]
+        except Exception:  # noqa: BLE001
+            pass
+        return el
+
+    def _js_set_composer_text(el, message_text: str) -> str:
         # Fallback for cases where Instagram drops keystrokes (e.g., only "T").
-        # Works for both contenteditable and textarea-like inputs.
-        driver.execute_script(
-            """
-            const el = arguments[0];
-            const text = arguments[1];
-            if (!el) return;
-            try { el.focus(); } catch (e) {}
+        # Returns the text content after attempting to set it.
+        try:
+            result = driver.execute_script(
+                """
+                const el = arguments[0];
+                const text = arguments[1];
+                if (!el) return '';
 
-            const tag = (el.tagName || "").toUpperCase();
-                        const ce = (el.getAttribute('contenteditable') || '').toLowerCase();
-                        const isCE = (ce === 'true' || ce === '');
+                                try { el.focus(); } catch (e) {}
+                                const target = (document.activeElement || el);
 
-                        if (tag === "TEXTAREA" || ("value" in el && !isCE)) {
-              try { el.value = text; } catch (e) {}
-            } else {
-                            // Try to update contenteditable in a way React/IG accepts.
-                            try {
-                                // Select all current content
-                                const sel = window.getSelection && window.getSelection();
-                                if (sel && el) {
-                                    const range = document.createRange();
-                                    range.selectNodeContents(el);
-                                    sel.removeAllRanges();
-                                    sel.addRange(range);
-                                }
-                            } catch (e) {}
+                                const tag = (target.tagName || '').toUpperCase();
+                                const ce = (target.getAttribute('contenteditable') || '').toLowerCase();
+                                const isCE = (ce === 'true' || ce === '');
 
-                            try {
-                                // These often trigger the right internal handlers.
-                                document.execCommand('selectAll', false, null);
-                                document.execCommand('delete', false, null);
-                                document.execCommand('insertText', false, text);
-                            } catch (e) {
-                                try { el.textContent = text; } catch (e2) {}
-                            }
-            }
+                const dispatchInput = () => {
+                  let evt;
+                  try { evt = new InputEvent('input', { bubbles: true }); }
+                  catch (e) { evt = new Event('input', { bubbles: true }); }
+                                    try { target.dispatchEvent(evt); } catch (e) {}
+                };
 
-            let evt;
-            try {
-              evt = new InputEvent('input', { bubbles: true });
-            } catch (e) {
-              evt = new Event('input', { bubbles: true });
-            }
-            try { el.dispatchEvent(evt); } catch (e) {}
-            """,
-            el,
-            message_text,
-        )
+                if (tag === 'TEXTAREA' || (('value' in el) && !isCE)) {
+                                    try { target.value = text; } catch (e) {}
+                  dispatchInput();
+                                    try { return String(target.value || ''); } catch (e) { return ''; }
+                }
+
+                // contenteditable path
+                try {
+                  const sel = window.getSelection && window.getSelection();
+                  if (sel) {
+                    const range = document.createRange();
+                                        range.selectNodeContents(target);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                  }
+                } catch (e) {}
+
+                let ok = false;
+                try {
+                  document.execCommand('selectAll', false, null);
+                  document.execCommand('delete', false, null);
+                  ok = document.execCommand('insertText', false, text);
+                } catch (e) {
+                  ok = false;
+                }
+
+                if (!ok) {
+                  // Final fallback: replace DOM contents with a text node.
+                  try {
+                                        while (target.firstChild) target.removeChild(target.firstChild);
+                                        target.appendChild(document.createTextNode(text));
+                  } catch (e) {
+                                        try { target.textContent = text; } catch (e2) {}
+                  }
+                }
+
+                dispatchInput();
+                                try { return String(target.textContent || ''); } catch (e) { return ''; }
+                """,
+                el,
+                message_text,
+            )
+            return str(result or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _js_clear_composer(el) -> None:
         _js_set_composer_text(el, "")
 
     def _type_message(el, message_text: str) -> None:
-        # Focus + clear
-        ActionChains(driver).move_to_element(el).click(el).perform()
-        time.sleep(0.05)
+        # Instagram often re-renders the composer on the first keystroke. If we keep
+        # using the old WebElement reference, subsequent keys can go nowhere.
+        _focus(el)
+
+        def _active_editable_or_refocus() -> object:
+            active = driver.switch_to.active_element
+            active = _resolve_edit_target(active)
+            if not _is_editable(active):
+                _focus(el)
+                active = driver.switch_to.active_element
+                active = _resolve_edit_target(active)
+            return active
+
+        # Clear on the *current* active element.
         try:
-            el.send_keys(Keys.CONTROL, "a")
-            el.send_keys(Keys.BACKSPACE)
+            active = _active_editable_or_refocus()
+            active.send_keys(Keys.CONTROL, "a")
+            active.send_keys(Keys.BACKSPACE)
         except Exception:  # noqa: BLE001
             pass
 
-        # Type in chunks; Instagram sometimes drops fast key bursts.
-        chunk_size = 12
-        for i in range(0, len(message_text), chunk_size):
-            el.send_keys(message_text[i : i + chunk_size])
-            time.sleep(0.02)
+        # Type character-by-character, always targeting the current active element.
+        for ch in message_text:
+            try:
+                active = _active_editable_or_refocus()
+                active.send_keys(ch)
+            except StaleElementReferenceException:
+                # Re-render in the middle of typing; just continue.
+                continue
+            except Exception:  # noqa: BLE001
+                # Try once more after refocus.
+                try:
+                    _focus(el)
+                    active = _active_editable_or_refocus()
+                    active.send_keys(ch)
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(0.06)
 
     def _is_editable(el) -> bool:
         try:
@@ -165,8 +281,14 @@ def send_message(driver, text: str) -> bool:
                 last_error = exc
                 continue
 
+    if ordered:
+        _dump_candidates("Composer candidates (pre)", ordered)
+
     for composer in ordered[:3]:
         try:
+            composer = _resolve_edit_target(composer)
+            _focus(composer)
+
             # Clear using JS first to avoid stuck leftovers.
             try:
                 _js_clear_composer(composer)
@@ -184,6 +306,7 @@ def send_message(driver, text: str) -> bool:
                     composed[:20],
                 )
                 active = driver.switch_to.active_element
+                active = _resolve_edit_target(active)
                 _type_message(active, message)
                 composer = active
                 composed = _read_composer_text(composer)
@@ -195,8 +318,8 @@ def send_message(driver, text: str) -> bool:
                     message[:20],
                     composed[:20],
                 )
-                _js_set_composer_text(composer, message)
-                composed = _read_composer_text(composer)
+                js_after = _js_set_composer_text(composer, message)
+                composed = (js_after or "").strip() or _read_composer_text(composer)
 
             LOGGER.debug("Composer contains (len=%d): %s", len(composed), composed[:80])
             if _normalize(composed) != _normalize(message):
@@ -205,6 +328,7 @@ def send_message(driver, text: str) -> bool:
                     message[:40],
                     composed[:40],
                 )
+                last_error = ValueError("composer_mismatch")
                 continue
 
             composer.send_keys(Keys.ENTER)
@@ -213,5 +337,7 @@ def send_message(driver, text: str) -> bool:
             last_error = exc
             continue
 
-    LOGGER.warning("Could not find/click message composer textbox (last_error=%s)", type(last_error).__name__)
+    if ordered:
+        _dump_candidates("Composer candidates (post-fail)", ordered)
+    LOGGER.warning("Failed to compose/send message (last_error=%s)", type(last_error).__name__)
     return False
