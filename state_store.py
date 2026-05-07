@@ -5,6 +5,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+@dataclass(frozen=True)
+class ThreadMessage:
+    id: int
+    thread_url: str
+    direction: str
+    text: str
+    observed_at_utc: str
+
+
 @dataclass
 class ThreadState:
     thread_url: str
@@ -65,6 +74,26 @@ class StateStore:
             self.conn.execute(stmt)
         if migrations:
             self.conn.commit()
+
+        # Message history table (append-only).
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_url TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                text TEXT NOT NULL,
+                observed_at_utc TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_thread_messages_thread_id
+            ON thread_messages(thread_url, id)
+            """
+        )
+        self.conn.commit()
 
     def get_thread_state(self, thread_url: str) -> ThreadState:
         row = self.conn.execute(
@@ -177,6 +206,134 @@ class StateStore:
             ),
         )
         self.conn.commit()
+
+    def append_thread_messages(
+        self,
+        thread_url: str,
+        messages: list[tuple[str, str, str]],
+        *,
+        max_per_thread: int | None = None,
+    ) -> int:
+        """Append messages to the per-thread history.
+
+        messages: list of (direction, text, observed_at_utc)
+        Returns number of inserted rows.
+        """
+
+        rows = [
+            (thread_url, (direction or "unknown"), (text or "").strip(), observed_at_utc)
+            for direction, text, observed_at_utc in messages
+            if (text or "").strip()
+        ]
+        if not rows:
+            return 0
+
+        self.conn.executemany(
+            """
+            INSERT INTO thread_messages (thread_url, direction, text, observed_at_utc)
+            VALUES (?, ?, ?, ?)
+            """,
+            rows,
+        )
+        inserted = len(rows)
+        self.conn.commit()
+
+        if max_per_thread is not None and max_per_thread > 0:
+            # Keep only the most recent max_per_thread rows.
+            self.conn.execute(
+                """
+                DELETE FROM thread_messages
+                WHERE thread_url = ?
+                  AND id NOT IN (
+                    SELECT id FROM thread_messages
+                    WHERE thread_url = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                  )
+                """,
+                (thread_url, thread_url, int(max_per_thread)),
+            )
+            self.conn.commit()
+
+        return inserted
+
+    def get_recent_thread_messages(self, thread_url: str, limit: int) -> list[ThreadMessage]:
+        if limit <= 0:
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT id, thread_url, direction, text, observed_at_utc
+            FROM thread_messages
+            WHERE thread_url = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (thread_url, int(limit)),
+        ).fetchall()
+
+        msgs = [
+            ThreadMessage(
+                id=int(r["id"]),
+                thread_url=str(r["thread_url"]),
+                direction=str(r["direction"]),
+                text=str(r["text"]),
+                observed_at_utc=str(r["observed_at_utc"]),
+            )
+            for r in rows
+        ]
+        msgs.reverse()  # chronological
+        return msgs
+
+    @staticmethod
+    def _norm_message_key(direction: str, text: str) -> tuple[str, str]:
+        d = (direction or "unknown").strip().lower()
+        # Collapse whitespace for robust matching.
+        t = " ".join((text or "").strip().split()).lower()
+        return d, t
+
+    def update_history_from_tail(
+        self,
+        thread_url: str,
+        tail_messages: list[tuple[str, str]],
+        observed_at_utc: str,
+        *,
+        max_per_thread: int | None = None,
+    ) -> int:
+        """Idempotently append unseen tail messages based on sequence overlap.
+
+        This avoids relying on unstable DOM geometry for message identity.
+        """
+
+        tail = [(d, (t or "").strip()) for d, t in (tail_messages or []) if (t or "").strip()]
+        if not tail:
+            return 0
+
+        tail_keys = [self._norm_message_key(d, t) for d, t in tail]
+        m = len(tail_keys)
+
+        # Load last m messages already stored for this thread (chronological).
+        stored_rows = self.get_recent_thread_messages(thread_url, limit=m)
+        stored_keys = [self._norm_message_key(r.direction, r.text) for r in stored_rows]
+
+        max_k = min(len(stored_keys), m)
+        overlap = 0
+        for k in range(max_k, -1, -1):
+            if k == 0:
+                overlap = 0
+                break
+            if stored_keys[-k:] == tail_keys[:k]:
+                overlap = k
+                break
+
+        new_tail = tail[overlap:]
+        if not new_tail:
+            return 0
+
+        return self.append_thread_messages(
+            thread_url,
+            [(d, t, observed_at_utc) for d, t in new_tail],
+            max_per_thread=max_per_thread,
+        )
 
     def close(self) -> None:
         self.conn.close()

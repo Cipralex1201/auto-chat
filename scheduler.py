@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from browser import BrowserManager
 from config import Settings
 from dm_reader import ThreadSnapshot, read_watched_threads
-from reply_llm import generate_reply_placeholder
+from reply_llm import generate_reply
 from sender import send_message
 from session import login_if_needed
 from state_store import StateStore
@@ -114,8 +114,23 @@ class BotScheduler:
         attempt_backoff_sec = 10
         max_attempts_per_inbound = 3
 
+        # Message history storage and LLM context.
+        history_n = getattr(self.settings, "llm_history_n", 20)
+        max_store = getattr(self.settings, "max_stored_messages_per_thread", 1000)
+
         for snap in snapshots:
             state = self.store.get_thread_state(snap.thread_url)
+
+            # Persist tail window into message history (idempotent overlap update).
+            try:
+                self.store.update_history_from_tail(
+                    snap.thread_url,
+                    getattr(snap, "tail_messages", []) or [],
+                    snap.observed_at_utc,
+                    max_per_thread=max_store,
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to persist message history (thread=%s)", snap.thread_url)
 
             if snap.message_fingerprint == "EMPTY":
                 LOGGER.warning("Skipping thread %s this cycle: extraction returned EMPTY", snap.thread_url)
@@ -242,7 +257,12 @@ class BotScheduler:
             time.sleep(delay_sec)
 
             self._ensure_thread_open(driver, snap.thread_url)
-            reply_text = generate_reply_placeholder(incoming_text, self.settings.dry_run_reply_text)
+            history = []
+            try:
+                history = self.store.get_recent_thread_messages(snap.thread_url, limit=int(history_n))
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to load message history for LLM (thread=%s)", snap.thread_url)
+            reply_text = generate_reply(history, self.settings, fallback=self.settings.dry_run_reply_text)
 
             if self.settings.enable_sending:
                 ok = send_message(driver, reply_text)
@@ -257,6 +277,16 @@ class BotScheduler:
                     continue
             else:
                 LOGGER.info("DRY RUN reply for thread=%s text=%s", snap.thread_url, reply_text)
+
+            # Store outgoing reply in history so LLM context remains accurate even if UI lags.
+            try:
+                self.store.append_thread_messages(
+                    snap.thread_url,
+                    [("outgoing", reply_text, now_utc_iso())],
+                    max_per_thread=max_store,
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to persist outgoing message history (thread=%s)", snap.thread_url)
 
             # Mark inbound as replied-to. Even if Instagram UI bounces, this prevents re-reply spam.
             state.first_reply_sent = 1

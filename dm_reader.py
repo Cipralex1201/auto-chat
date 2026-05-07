@@ -36,6 +36,9 @@ class ThreadSnapshot:
 
     # For optional send verification/debug.
     latest_outgoing_text: str | None
+
+    # Chronological tail window of messages for history persistence.
+    tail_messages: list[tuple[str, str]]
     observed_at_utc: str
 
 
@@ -85,6 +88,16 @@ def _is_ignored_text(text: str) -> bool:
 
     # Keep short real messages too (e.g., "ok"), but drop isolated UI glyph-like chars.
     if len(normalized) == 1 and not normalized.isalnum():
+        return True
+
+    # Typing indicator bubble often renders as just dots/ellipsis glyphs.
+    # Examples observed across UIs: "...", "···", "…", "• • •".
+    compact = re.sub(r"\s+", "", normalized)
+    if compact and re.fullmatch(r"[.·•…]{1,8}", compact):
+        return True
+
+    # Inbox/thread-list preview prefix (not an actual message bubble).
+    if lowered.startswith("you:") and len(lowered) <= 200:
         return True
 
     return False
@@ -268,12 +281,54 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
     but still allow repeated identical messages if they appear at different vertical positions.
     """
 
-    try:
-        main = driver.find_element(By.XPATH, MAIN_CONTAINER_XPATH)
-        main_rect = main.rect
-        main_mid_x = float(main_rect.get("x", 0.0)) + float(main_rect.get("width", 0.0)) / 2.0
-    except Exception:  # noqa: BLE001
-        main_mid_x = 0.0
+    # Determine the message pane midpoint using the composer position.
+    # This helps us avoid extracting text from the left sidebar thread list.
+    pane_mid_x = 0.0
+    x_filter_min: float | None = None
+    x_filter_max: float | None = None
+
+    composer_xpaths = [
+        f"{MAIN_CONTAINER_XPATH}//div[@role='textbox' and (@contenteditable='true' or @contenteditable='')]",
+        f"{MAIN_CONTAINER_XPATH}//textarea",
+    ]
+
+    composer_rect: dict | None = None
+    for cxp in composer_xpaths:
+        try:
+            els = driver.find_elements(By.XPATH, cxp)
+        except Exception:  # noqa: BLE001
+            els = []
+        if not els:
+            continue
+        # Prefer the bottom-most composer (visually) in case there are multiple.
+        best = None
+        best_y = None
+        for el in els:
+            rect = _safe_rect(el)
+            if rect is None:
+                continue
+            y = float(rect.get("y", 0.0))
+            if best_y is None or y >= best_y:
+                best_y = y
+                best = rect
+        if best is not None:
+            composer_rect = best
+            break
+
+    if composer_rect is not None:
+        cx = float(composer_rect.get("x", 0.0))
+        cw = float(composer_rect.get("width", 0.0))
+        pane_mid_x = cx + cw / 2.0
+        # Allow some slack so bubbles just above/around the composer are included.
+        x_filter_min = cx - 250.0
+        x_filter_max = cx + cw + 250.0
+    else:
+        try:
+            main = driver.find_element(By.XPATH, MAIN_CONTAINER_XPATH)
+            main_rect = main.rect
+            pane_mid_x = float(main_rect.get("x", 0.0)) + float(main_rect.get("width", 0.0)) / 2.0
+        except Exception:  # noqa: BLE001
+            pane_mid_x = 0.0
 
     row_xpath = f"{MAIN_CONTAINER_XPATH}//*[@role='row']"
     listitem_xpath = f"{MAIN_CONTAINER_XPATH}//*[@role='listitem']"
@@ -293,8 +348,19 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
         norm = _normalize_text(text)
         if not norm or _is_ignored_text(norm):
             return
+
+        # If we found a composer, only accept candidates that visually live in the same pane.
+        # This avoids accidentally reading thread previews from the left sidebar.
+        if x_filter_min is not None and x_filter_max is not None:
+            try:
+                mid_x = float(rect.get("x", 0.0)) + float(rect.get("width", 0.0)) / 2.0
+            except Exception:  # noqa: BLE001
+                mid_x = None
+            if mid_x is None or not (x_filter_min <= mid_x <= x_filter_max):
+                return
+
         bottom = float(rect.get("y", 0.0)) + float(rect.get("height", 0.0))
-        direction = _classify_direction(main_mid_x, rect)
+        direction = _classify_direction(pane_mid_x, rect)
         raw.append((direction, norm, bottom))
 
     for attempt in range(2):
@@ -407,6 +473,8 @@ def read_thread_snapshot(driver, thread_url: str) -> ThreadSnapshot:
 
     latest_text: str = tail[-1][1] if tail else ""
 
+    tail_messages: list[tuple[str, str]] = [(d, t) for d, t, _ in tail] if tail else []
+
     if tail:
         parts = [(d, t) for d, t, _ in tail]
         observed_hash = _fingerprint_parts(parts)
@@ -425,9 +493,13 @@ def read_thread_snapshot(driver, thread_url: str) -> ThreadSnapshot:
                 last_out_idx = idx
 
         if last_in_idx is not None:
-            incoming_parts = parts[: last_in_idx + 1]
-            latest_incoming_fingerprint = f"in:{_fingerprint_parts(incoming_parts)}"
-            latest_incoming_text = tail[last_in_idx][1]
+            # Stable per-bubble key: hash incoming text + coarse vertical bucket.
+            # This stays stable across polls even if the tail window prefix changes.
+            _d, _t, _b = tail[last_in_idx]
+            bucket = int(float(_b) // 40)
+            content_hash = hashlib.sha256(f"incoming\n{_t}\n{bucket}".encode()).hexdigest()[:16]
+            latest_incoming_fingerprint = f"in:{content_hash}"
+            latest_incoming_text = _t
 
         if last_out_idx is not None:
             latest_outgoing_text = tail[last_out_idx][1]
@@ -460,6 +532,7 @@ def read_thread_snapshot(driver, thread_url: str) -> ThreadSnapshot:
         latest_incoming_fingerprint=latest_incoming_fingerprint,
         latest_incoming_text=latest_incoming_text,
         latest_outgoing_text=latest_outgoing_text,
+        tail_messages=tail_messages,
         observed_at_utc=observed_at,
     )
 

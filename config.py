@@ -41,6 +41,20 @@ class Settings:
     log_level: str
     log_file: Path | None
 
+    # LLM responder settings (OpenAI-compatible)
+    llm_enabled: bool
+    llm_api_key: str
+    llm_base_url: str
+    llm_model: str
+    llm_history_n: int
+    llm_master_prompt_file: Path
+    llm_temperature: float
+    llm_max_tokens: int
+    llm_timeout_sec: int
+
+    # Storage bound
+    max_stored_messages_per_thread: int
+
 
 def _get_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -103,6 +117,18 @@ def load_settings() -> Settings:
         dry_run_reply_text=os.getenv("DRY_RUN_REPLY_TEXT", "Thanks! I saw your message.").strip(),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
         log_file=_parse_optional_path(os.getenv("LOG_FILE", "./logs/bot.log")),
+
+        llm_enabled=_get_bool("LLM_ENABLED", "false"),
+        llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
+        llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").strip(),
+        llm_model=os.getenv("LLM_MODEL", "").strip(),
+        llm_history_n=_get_int("LLM_HISTORY_N", 20),
+        llm_master_prompt_file=Path(os.getenv("LLM_MASTER_PROMPT_FILE", "./master_prompt.txt")).expanduser(),
+        llm_temperature=_get_float("LLM_TEMPERATURE", 0.2),
+        llm_max_tokens=_get_int("LLM_MAX_TOKENS", 200),
+        llm_timeout_sec=_get_int("LLM_TIMEOUT_SEC", 30),
+
+        max_stored_messages_per_thread=_get_int("MAX_STORED_MESSAGES_PER_THREAD", 1000),
     )
 
     if settings.idle_min_sec > settings.idle_max_sec:
@@ -117,5 +143,16 @@ def load_settings() -> Settings:
         raise ValueError("CONVERSATION_EXPIRE_MIN_SEC must be <= CONVERSATION_EXPIRE_MAX_SEC")
     if not (0.0 <= settings.skip_reply_probability <= 1.0):
         raise ValueError("SKIP_REPLY_PROBABILITY must be between 0 and 1")
+
+    if settings.llm_history_n < 0:
+        raise ValueError("LLM_HISTORY_N must be >= 0")
+    if settings.llm_max_tokens < 1:
+        raise ValueError("LLM_MAX_TOKENS must be >= 1")
+    if settings.llm_timeout_sec < 1:
+        raise ValueError("LLM_TIMEOUT_SEC must be >= 1")
+    if not (0.0 <= settings.llm_temperature <= 2.0):
+        raise ValueError("LLM_TEMPERATURE must be between 0 and 2")
+    if settings.max_stored_messages_per_thread < 0:
+        raise ValueError("MAX_STORED_MESSAGES_PER_THREAD must be >= 0")
 
     return settings
