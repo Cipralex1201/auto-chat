@@ -52,6 +52,11 @@ class Settings:
     llm_max_tokens: int
     llm_timeout_sec: int
 
+    # LLM debugging
+    llm_debug_dump_prompts: bool
+    llm_debug_dump_dir: Path
+    llm_debug_dump_only: bool
+
     # Storage bound
     max_stored_messages_per_thread: int
 
@@ -127,6 +132,10 @@ def load_settings() -> Settings:
         llm_temperature=_get_float("LLM_TEMPERATURE", 0.2),
         llm_max_tokens=_get_int("LLM_MAX_TOKENS", 200),
         llm_timeout_sec=_get_int("LLM_TIMEOUT_SEC", 30),
+
+        llm_debug_dump_prompts=_get_bool("LLM_DEBUG_DUMP_PROMPTS", "false"),
+        llm_debug_dump_dir=Path(os.getenv("LLM_DEBUG_DUMP_DIR", "./logs/llm_prompts")).expanduser(),
+        llm_debug_dump_only=_get_bool("LLM_DEBUG_DUMP_ONLY", "false"),
 
         max_stored_messages_per_thread=_get_int("MAX_STORED_MESSAGES_PER_THREAD", 1000),
     )

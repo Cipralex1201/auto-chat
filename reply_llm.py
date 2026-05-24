@@ -1,15 +1,51 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any
 
 from state_store import ThreadMessage
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _safe_thread_tag(thread_url: str) -> str:
+    normalized = (thread_url or "").strip()
+    if not normalized:
+        return "thread_unknown"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:10]
+    return f"thread_{digest}"
+
+
+def _dump_llm_payload(settings, payload: dict[str, Any], *, thread_url: str) -> None:
+    if not (
+        _as_bool(getattr(settings, "llm_debug_dump_prompts", False))
+        or _as_bool(getattr(settings, "llm_debug_dump_only", False))
+    ):
+        return
+
+    dump_dir = getattr(settings, "llm_debug_dump_dir", None)
+    if not dump_dir:
+        return
+
+    try:
+        os.makedirs(str(dump_dir), exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        fname = f"llm_payload_{ts}_{_safe_thread_tag(thread_url)}_{time.time_ns()}.json"
+        path = os.path.join(str(dump_dir), fname)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        LOGGER.info("LLM debug: dumped prompt payload to %s", path)
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("LLM debug: failed to dump prompt payload")
 
 
 def _read_text_file(path: str) -> str:
@@ -73,21 +109,20 @@ def generate_reply(history: list[ThreadMessage], settings, *, fallback: str) -> 
     fallback_text = (fallback or "").strip() or "auto reply"
 
     enabled = _as_bool(getattr(settings, "llm_enabled", False))
-    if not enabled:
+    debug_dump_prompts = _as_bool(getattr(settings, "llm_debug_dump_prompts", False))
+    debug_dump_only = _as_bool(getattr(settings, "llm_debug_dump_only", False))
+    want_payload_dump = debug_dump_prompts or debug_dump_only
+
+    # If neither real LLM nor dumping is desired, fast path.
+    if not enabled and not want_payload_dump:
         return fallback_text
 
-    api_key = (getattr(settings, "llm_api_key", "") or os.getenv("LLM_API_KEY", "")).strip()
-    if not api_key:
-        LOGGER.warning("LLM enabled but LLM_API_KEY is empty; using fallback")
-        return fallback_text
-
+    # Build the payload (so we can dump it) even if LLM is disabled.
     base_url = (getattr(settings, "llm_base_url", "") or "https://api.openai.com/v1").strip().rstrip("/")
-    model = (getattr(settings, "llm_model", "") or "").strip()
-    if not model:
-        LOGGER.warning("LLM enabled but LLM_MODEL is empty; using fallback")
-        return fallback_text
+    model_for_dump = (getattr(settings, "llm_model", "") or "").strip() or "(unset)"
 
-    master_prompt_file = (getattr(settings, "llm_master_prompt_file", "") or "./master_prompt.txt").strip()
+    master_prompt_file_value = getattr(settings, "llm_master_prompt_file", "./master_prompt.txt")
+    master_prompt_file = str(master_prompt_file_value).strip() or "./master_prompt.txt"
     system_prompt = _read_text_file(master_prompt_file)
 
     temperature = float(getattr(settings, "llm_temperature", 0.2))
@@ -99,8 +134,38 @@ def generate_reply(history: list[ThreadMessage], settings, *, fallback: str) -> 
         messages.append({"role": "system", "content": system_prompt})
     messages.extend(_to_chat_messages(history))
 
+    payload: dict[str, Any] = {
+        "model": model_for_dump,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    thread_url = history[-1].thread_url if history else ""
+    if want_payload_dump:
+        _dump_llm_payload(settings, payload, thread_url=thread_url)
+
+    # Dump-only is explicitly "no network request".
+    if debug_dump_only:
+        return fallback_text
+
+    # If LLM is disabled, we only dump payload (above) and stop here.
+    if not enabled:
+        return fallback_text
+
+    # Guard: don't call an LLM if we have no user messages.
     if not any(m.get("role") == "user" for m in messages):
         LOGGER.info("LLM: no user messages in history; using fallback")
+        return fallback_text
+
+    api_key = (getattr(settings, "llm_api_key", "") or os.getenv("LLM_API_KEY", "")).strip()
+    if not api_key:
+        LOGGER.warning("LLM enabled but LLM_API_KEY is empty; using fallback")
+        return fallback_text
+
+    real_model = (getattr(settings, "llm_model", "") or "").strip()
+    if not real_model:
+        LOGGER.warning("LLM enabled but LLM_MODEL is empty; using fallback")
         return fallback_text
 
     url = f"{base_url}/chat/completions"
@@ -108,12 +173,7 @@ def generate_reply(history: list[ThreadMessage], settings, *, fallback: str) -> 
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+    payload["model"] = real_model
 
     try:
         result = _post_json(url, headers, payload, timeout_sec=timeout_sec)

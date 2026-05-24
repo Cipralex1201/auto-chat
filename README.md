@@ -15,7 +15,7 @@ LLM prompt assembly/integration is intentionally left for a later phase.
 - `browser.py`: starts Firefox with a fixed profile and handles restart/close lifecycle
 - `session.py`: checks login state and performs credential login attempt
 - `dm_reader.py`: opens watched DM thread URLs and snapshots latest message text
-- `reply_llm.py`: placeholder reply generator (no external API yet)
+- `reply_llm.py`: reply generator using an OpenAI-compatible Chat Completions API
 - `sender.py`: sends a message through DM composer when sending is enabled
 - `state_store.py`: SQLite state persistence
 - `scheduler.py`: idle/active mode scheduling, delays, randomization, browser recycle
@@ -35,6 +35,12 @@ LLM prompt assembly/integration is intentionally left for a later phase.
 ```bash
 python main.py
 ```
+
+## Debug: view the assembled LLM prompt
+
+Set `LLM_DEBUG_DUMP_PROMPTS=true` to write the exact JSON payload (system prompt + message history) to `./logs/llm_prompts/` right before the API call.
+
+If you only want to validate prompt assembly (no network request), also set `LLM_DEBUG_DUMP_ONLY=true`.
 
 ## Timing Model
 

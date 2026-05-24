@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+_UNSET = object()
+
+
 @dataclass(frozen=True)
 class ThreadMessage:
     id: int
@@ -27,9 +30,14 @@ class ThreadState:
     last_replied_incoming_text: str | None
     last_reply_utc: str | None
 
+    # Stable dedupe based on persisted message history IDs
+    last_replied_incoming_msg_id: int | None
+
     last_attempt_incoming_fingerprint: str | None
     last_attempt_utc: str | None
     attempt_count: int
+
+    last_attempt_incoming_msg_id: int | None
 
 
 class StateStore:
@@ -66,9 +74,11 @@ class StateStore:
         add_col("last_replied_incoming_fingerprint", "TEXT")
         add_col("last_replied_incoming_text", "TEXT")
         add_col("last_reply_utc", "TEXT")
+        add_col("last_replied_incoming_msg_id", "INTEGER")
         add_col("last_attempt_incoming_fingerprint", "TEXT")
         add_col("last_attempt_utc", "TEXT")
         add_col("attempt_count", "INTEGER NOT NULL DEFAULT 0")
+        add_col("last_attempt_incoming_msg_id", "INTEGER")
 
         for stmt in migrations:
             self.conn.execute(stmt)
@@ -107,9 +117,11 @@ class StateStore:
                 last_replied_incoming_fingerprint,
                 last_replied_incoming_text,
                 last_reply_utc,
+                last_replied_incoming_msg_id,
                 last_attempt_incoming_fingerprint,
                 last_attempt_utc,
-                attempt_count
+                attempt_count,
+                last_attempt_incoming_msg_id
             FROM thread_state
             WHERE thread_url = ?
             """,
@@ -126,9 +138,11 @@ class StateStore:
                 last_replied_incoming_fingerprint=None,
                 last_replied_incoming_text=None,
                 last_reply_utc=None,
+                last_replied_incoming_msg_id=None,
                 last_attempt_incoming_fingerprint=None,
                 last_attempt_utc=None,
                 attempt_count=0,
+                last_attempt_incoming_msg_id=None,
             )
 
         return ThreadState(
@@ -140,9 +154,11 @@ class StateStore:
             last_replied_incoming_fingerprint=row["last_replied_incoming_fingerprint"],
             last_replied_incoming_text=row["last_replied_incoming_text"],
             last_reply_utc=row["last_reply_utc"],
+            last_replied_incoming_msg_id=(int(row["last_replied_incoming_msg_id"]) if row["last_replied_incoming_msg_id"] is not None else None),
             last_attempt_incoming_fingerprint=row["last_attempt_incoming_fingerprint"],
             last_attempt_utc=row["last_attempt_utc"],
             attempt_count=int(row["attempt_count"] or 0),
+            last_attempt_incoming_msg_id=(int(row["last_attempt_incoming_msg_id"]) if row["last_attempt_incoming_msg_id"] is not None else None),
         )
 
     def upsert_thread_state(
@@ -155,13 +171,22 @@ class StateStore:
         last_replied_incoming_fingerprint: str | None = None,
         last_replied_incoming_text: str | None = None,
         last_reply_utc: str | None = None,
+        last_replied_incoming_msg_id: int | None | object = _UNSET,
         last_attempt_incoming_fingerprint: str | None = None,
         last_attempt_utc: str | None = None,
+        last_attempt_incoming_msg_id: int | None | object = _UNSET,
         attempt_count: int | None = None,
     ) -> None:
-        # Keep attempt_count stable unless explicitly set.
+        # Keep some fields stable unless explicitly set.
+        current_state = self.get_thread_state(thread_url)
         if attempt_count is None:
-            attempt_count = self.get_thread_state(thread_url).attempt_count
+            attempt_count = current_state.attempt_count
+
+        # Preserve dedupe IDs unless explicitly provided.
+        if last_replied_incoming_msg_id is _UNSET:
+            last_replied_incoming_msg_id = current_state.last_replied_incoming_msg_id
+        if last_attempt_incoming_msg_id is _UNSET:
+            last_attempt_incoming_msg_id = current_state.last_attempt_incoming_msg_id
         self.conn.execute(
             """
             INSERT INTO thread_state (
@@ -173,11 +198,13 @@ class StateStore:
                 last_replied_incoming_fingerprint,
                 last_replied_incoming_text,
                 last_reply_utc,
+                last_replied_incoming_msg_id,
                 last_attempt_incoming_fingerprint,
                 last_attempt_utc,
-                attempt_count
+                attempt_count,
+                last_attempt_incoming_msg_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_url) DO UPDATE SET
                 last_seen_fingerprint = excluded.last_seen_fingerprint,
                 last_seen_text = excluded.last_seen_text,
@@ -186,9 +213,11 @@ class StateStore:
                 last_replied_incoming_fingerprint = excluded.last_replied_incoming_fingerprint,
                 last_replied_incoming_text = excluded.last_replied_incoming_text,
                 last_reply_utc = excluded.last_reply_utc,
+                last_replied_incoming_msg_id = excluded.last_replied_incoming_msg_id,
                 last_attempt_incoming_fingerprint = excluded.last_attempt_incoming_fingerprint,
                 last_attempt_utc = excluded.last_attempt_utc,
                 attempt_count = excluded.attempt_count,
+                last_attempt_incoming_msg_id = excluded.last_attempt_incoming_msg_id,
                 updated_at_utc = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             """,
             (
@@ -200,12 +229,58 @@ class StateStore:
                 last_replied_incoming_fingerprint,
                 last_replied_incoming_text,
                 last_reply_utc,
+                last_replied_incoming_msg_id,
                 last_attempt_incoming_fingerprint,
                 last_attempt_utc,
                 attempt_count,
+                last_attempt_incoming_msg_id,
             ),
         )
         self.conn.commit()
+
+    def get_latest_incoming_message(self, thread_url: str) -> ThreadMessage | None:
+        row = self.conn.execute(
+            """
+            SELECT id, thread_url, direction, text, observed_at_utc
+            FROM thread_messages
+            WHERE thread_url = ?
+              AND direction = 'incoming'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (thread_url,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ThreadMessage(
+            id=int(row["id"]),
+            thread_url=str(row["thread_url"]),
+            direction=str(row["direction"]),
+            text=str(row["text"]),
+            observed_at_utc=str(row["observed_at_utc"]),
+        )
+
+    def get_latest_outgoing_message(self, thread_url: str) -> ThreadMessage | None:
+        row = self.conn.execute(
+            """
+            SELECT id, thread_url, direction, text, observed_at_utc
+            FROM thread_messages
+            WHERE thread_url = ?
+              AND direction = 'outgoing'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (thread_url,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ThreadMessage(
+            id=int(row["id"]),
+            thread_url=str(row["thread_url"]),
+            direction=str(row["direction"]),
+            text=str(row["text"]),
+            observed_at_utc=str(row["observed_at_utc"]),
+        )
 
     def append_thread_messages(
         self,

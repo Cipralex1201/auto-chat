@@ -162,16 +162,87 @@ class BotScheduler:
                 attempt_count=state.attempt_count,
             )
 
-            incoming_fp = getattr(snap, "latest_incoming_fingerprint", None)
-            incoming_text = getattr(snap, "latest_incoming_text", None) or ""
+            latest_in = None
+            latest_out = None
+            try:
+                latest_in = self.store.get_latest_incoming_message(snap.thread_url)
+                latest_out = self.store.get_latest_outgoing_message(snap.thread_url)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to load latest in/out messages for thread (thread=%s)", snap.thread_url)
 
-            if not incoming_fp:
-                LOGGER.debug("No incoming candidate found; no reply (thread=%s)", snap.thread_url)
+            if latest_in is None:
+                LOGGER.debug("No incoming candidate found in DB; no reply (thread=%s)", snap.thread_url)
                 continue
 
-            if state.last_replied_incoming_fingerprint == incoming_fp:
-                LOGGER.debug("Incoming already replied-to; no reply (thread=%s)", snap.thread_url)
+            incoming_msg_id = int(latest_in.id)
+            incoming_text = (latest_in.text or "").strip()
+
+            if state.last_replied_incoming_msg_id == incoming_msg_id:
+                LOGGER.debug("Incoming already replied-to (msg_id=%s); no reply (thread=%s)", incoming_msg_id, snap.thread_url)
                 continue
+
+            # Fallback dedupe: if the latest inbound text matches the last replied inbound text
+            # and the last reply was recent, treat it as already-handled. This protects against
+            # accidental duplicate inserts of the same inbound due to DOM/extraction overlap drift.
+            last_reply_dt = parse_iso(state.last_reply_utc)
+            if (
+                incoming_text
+                and state.last_replied_incoming_text
+                and incoming_text == (state.last_replied_incoming_text or "").strip()
+                and last_reply_dt is not None
+            ):
+                since = (datetime.now(timezone.utc) - last_reply_dt).total_seconds()
+                if since <= 300:
+                    LOGGER.info(
+                        "Skipping: inbound text matches recently replied inbound (%.1fs) (thread=%s)",
+                        since,
+                        snap.thread_url,
+                    )
+                    self.store.upsert_thread_state(
+                        thread_url=snap.thread_url,
+                        last_seen_fingerprint=snap.message_fingerprint,
+                        last_seen_text=snap.message_text,
+                        last_activity_utc=snap.observed_at_utc,
+                        first_reply_sent=state.first_reply_sent,
+                        last_replied_incoming_fingerprint=getattr(snap, "latest_incoming_fingerprint", None),
+                        last_replied_incoming_text=incoming_text,
+                        last_reply_utc=state.last_reply_utc,
+                        last_replied_incoming_msg_id=incoming_msg_id,
+                    )
+                    continue
+
+            # Echo guard: if extraction misclassified our own outgoing as incoming,
+            # avoid reply loops by detecting when latest incoming == very recent outgoing text.
+            if latest_out is not None:
+                out_text = (latest_out.text or "").strip()
+                if out_text and incoming_text and out_text == incoming_text:
+                    out_dt = parse_iso(getattr(latest_out, "observed_at_utc", None))
+                    in_dt = parse_iso(getattr(latest_in, "observed_at_utc", None))
+                    if out_dt is not None and in_dt is not None:
+                        delta = abs((in_dt - out_dt).total_seconds())
+                        if delta <= 300:
+                            LOGGER.info(
+                                "Skipping: latest incoming matches recent outgoing (echo guard, %.1fs) (thread=%s)",
+                                delta,
+                                snap.thread_url,
+                            )
+                            # Mark as replied-to to suppress further loops.
+                            self.store.upsert_thread_state(
+                                thread_url=snap.thread_url,
+                                last_seen_fingerprint=snap.message_fingerprint,
+                                last_seen_text=snap.message_text,
+                                last_activity_utc=snap.observed_at_utc,
+                                first_reply_sent=state.first_reply_sent,
+                                last_replied_incoming_fingerprint=state.last_replied_incoming_fingerprint,
+                                last_replied_incoming_text=incoming_text,
+                                last_reply_utc=state.last_reply_utc,
+                                last_replied_incoming_msg_id=incoming_msg_id,
+                                last_attempt_incoming_fingerprint=None,
+                                last_attempt_utc=None,
+                                last_attempt_incoming_msg_id=None,
+                                attempt_count=0,
+                            )
+                            continue
 
             if self._looks_like_bot_message(incoming_text):
                 LOGGER.info("Skipping: latest incoming looks bot-authored (thread=%s)", snap.thread_url)
@@ -182,11 +253,13 @@ class BotScheduler:
                     last_seen_text=snap.message_text,
                     last_activity_utc=snap.observed_at_utc,
                     first_reply_sent=state.first_reply_sent,
-                    last_replied_incoming_fingerprint=incoming_fp,
+                    last_replied_incoming_fingerprint=getattr(snap, "latest_incoming_fingerprint", None),
                     last_replied_incoming_text=incoming_text,
                     last_reply_utc=state.last_reply_utc,
+                    last_replied_incoming_msg_id=incoming_msg_id,
                     last_attempt_incoming_fingerprint=None,
                     last_attempt_utc=None,
+                    last_attempt_incoming_msg_id=None,
                     attempt_count=0,
                 )
                 continue
@@ -204,7 +277,7 @@ class BotScheduler:
                     continue
 
             # Attempt backoff / attempt limit per inbound.
-            if state.last_attempt_incoming_fingerprint == incoming_fp:
+            if state.last_attempt_incoming_msg_id == incoming_msg_id:
                 last_attempt_dt = parse_iso(state.last_attempt_utc)
                 if state.attempt_count >= max_attempts_per_inbound:
                     LOGGER.warning(
@@ -238,7 +311,7 @@ class BotScheduler:
                 continue
 
             # Record attempt before sleeping/sending to reduce chance of rapid duplicates.
-            attempt_count = state.attempt_count + 1 if state.last_attempt_incoming_fingerprint == incoming_fp else 1
+            attempt_count = state.attempt_count + 1 if state.last_attempt_incoming_msg_id == incoming_msg_id else 1
             self.store.upsert_thread_state(
                 thread_url=snap.thread_url,
                 last_seen_fingerprint=snap.message_fingerprint,
@@ -248,8 +321,9 @@ class BotScheduler:
                 last_replied_incoming_fingerprint=state.last_replied_incoming_fingerprint,
                 last_replied_incoming_text=state.last_replied_incoming_text,
                 last_reply_utc=state.last_reply_utc,
-                last_attempt_incoming_fingerprint=incoming_fp,
+                last_attempt_incoming_fingerprint=getattr(snap, "latest_incoming_fingerprint", None),
                 last_attempt_utc=now_utc_iso(),
+                last_attempt_incoming_msg_id=incoming_msg_id,
                 attempt_count=attempt_count,
             )
 
@@ -297,11 +371,13 @@ class BotScheduler:
                 last_seen_text=snap.message_text,
                 last_activity_utc=snap.observed_at_utc,
                 first_reply_sent=state.first_reply_sent,
-                last_replied_incoming_fingerprint=incoming_fp,
+                last_replied_incoming_fingerprint=getattr(snap, "latest_incoming_fingerprint", None),
                 last_replied_incoming_text=incoming_text,
                 last_reply_utc=replied_at,
+                last_replied_incoming_msg_id=incoming_msg_id,
                 last_attempt_incoming_fingerprint=None,
                 last_attempt_utc=None,
+                last_attempt_incoming_msg_id=None,
                 attempt_count=0,
             )
 
