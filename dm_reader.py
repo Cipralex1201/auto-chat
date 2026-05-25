@@ -126,13 +126,50 @@ def _safe_rect(el) -> dict | None:
         return None
 
 
-def _get_thread_header_texts(driver) -> set[str]:
-    """Best-effort collection of thread header texts (username/title).
+_USERNAME_LIKE = re.compile(r"^[a-z0-9._]{3,40}$")
 
-    These can sometimes appear in the same pane and get picked up by the broad
-    bubble/text XPaths. We ignore exact matches (case-insensitive) to avoid
-    polluting history with non-message UI rows.
+
+def _looks_like_ig_handle(text: str) -> bool:
+    """Return True if `text` looks like an Instagram handle (no '@').
+
+    We keep this conservative so we don't accidentally treat display names
+    (often Title Case) as handles.
     """
+
+    norm = (text or "").strip()
+    if not norm:
+        return False
+
+    compact = "".join(norm.split()).lstrip("@")
+    if not compact:
+        return False
+
+    # Handles are typically lowercase in the header UI; treat mixed/upper as display-name.
+    if compact != compact.lower():
+        return False
+
+    return _USERNAME_LIKE.fullmatch(compact) is not None
+
+
+def _get_thread_header_info(driver) -> tuple[set[str], set[str], float | None]:
+    """Return (header_texts_lower, handle_texts_lower, header_bottom_y).
+
+    Instagram can render thread header/caption strings inside the same main pane
+    and they can be picked up by broad bubble/text XPaths.
+
+    We treat handle-like header strings (e.g. "adamgyory") as *always ignored*
+    wherever they appear, because the UI may temporarily re-render them lower in
+    the pane during active updates.
+    """
+
+    header_bottom_y: float | None = None
+    try:
+        header_el = driver.find_element(By.XPATH, f"{MAIN_CONTAINER_XPATH}//header")
+        header_rect = _safe_rect(header_el)
+        if header_rect is not None:
+            header_bottom_y = float(header_rect.get("y", 0.0)) + float(header_rect.get("height", 0.0))
+    except Exception:  # noqa: BLE001
+        header_bottom_y = None
 
     xpaths = [
         f"{MAIN_CONTAINER_XPATH}//header//*[self::h1 or self::h2][normalize-space()]",
@@ -140,7 +177,9 @@ def _get_thread_header_texts(driver) -> set[str]:
         f"{MAIN_CONTAINER_XPATH}//header//div[normalize-space()]",
     ]
 
-    out: set[str] = set()
+    header_texts: set[str] = set()
+    header_handles: set[str] = set()
+
     for xp in xpaths:
         try:
             els = driver.find_elements(By.XPATH, xp)
@@ -156,16 +195,21 @@ def _get_thread_header_texts(driver) -> set[str]:
                 continue
             if _is_ignored_text(norm):
                 continue
+
             lowered = norm.lower()
             # Keep header candidates reasonably short to avoid catching large blocks.
-            if 1 < len(lowered) <= 60:
-                out.add(lowered)
+            if not (1 < len(lowered) <= 60):
+                continue
 
-        if out:
+            header_texts.add(lowered)
+            if _looks_like_ig_handle(norm):
+                header_handles.add(lowered.lstrip("@"))
+
+        if header_texts:
             # Prefer earlier/stronger header signals; if we found any, that's enough.
             break
 
-    return out
+    return header_texts, header_handles, header_bottom_y
 
 
 def _classify_direction(main_mid_x: float, bubble_rect: dict, margin_px: float = 30.0) -> str:
@@ -394,26 +438,36 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
 
     raw: list[tuple[str, str, float]] = []
 
-    header_ignored = set()
+    header_texts: set[str] = set()
+    header_handles: set[str] = set()
+    header_bottom_y: float | None = None
     try:
-        header_ignored = _get_thread_header_texts(driver)
+        header_texts, header_handles, header_bottom_y = _get_thread_header_info(driver)
     except Exception:  # noqa: BLE001
-        header_ignored = set()
+        header_texts, header_handles, header_bottom_y = set(), set(), None
 
     def add_candidate(text: str, rect: dict) -> None:
         norm = _normalize_text(text)
         if not norm or _is_ignored_text(norm):
             return
 
-        # Avoid treating the thread header username/title as a message.
-        if header_ignored and norm.lower() in header_ignored:
-            # Only ignore if it appears near the top of the viewport where headers live.
-            # This avoids dropping real messages that happen to equal the username.
+        lowered = norm.lower().lstrip("@")
+
+        # Avoid treating the thread header username/handle as a message.
+        # Robust behavior: ignore handle-like header strings wherever they appear,
+        # because IG sometimes re-renders them lower in the pane during active updates.
+        if header_handles and lowered in header_handles:
+            return
+
+        # For other header strings (e.g. display name), be conservative: ignore only
+        # when they appear inside the header band.
+        if header_texts and norm.lower() in header_texts:
             try:
                 y = float(rect.get("y", 0.0))
             except Exception:  # noqa: BLE001
                 y = 0.0
-            if y <= 200.0:
+            threshold = (header_bottom_y + 40.0) if header_bottom_y is not None else 200.0
+            if y <= threshold:
                 return
 
         # If we found a composer, only accept candidates that visually live in the same pane.
