@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -366,6 +367,16 @@ class StateStore:
         t = " ".join((text or "").strip().split()).lower()
         return d, t
 
+    @staticmethod
+    def _parse_iso(ts: str | None) -> datetime | None:
+        if not ts:
+            return None
+        try:
+            # Support both "+00:00" and "Z" suffixes (best-effort).
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:  # noqa: BLE001
+            return None
+
     def update_history_from_tail(
         self,
         thread_url: str,
@@ -401,6 +412,59 @@ class StateStore:
                 break
 
         new_tail = tail[overlap:]
+        if not new_tail:
+            return 0
+
+        # Secondary guard: if overlap matching breaks due to a spurious extracted row
+        # (e.g. header username), avoid re-inserting messages that are already present.
+        # This is especially important because outgoing replies are also persisted
+        # immediately after send, and rapid polling can repeatedly re-extract the same
+        # short incoming texts (e.g., "ok") without any new message actually arriving.
+        try:
+            recent_limit = max(50, m * 5)
+            recent_rows = self.get_recent_thread_messages(thread_url, limit=recent_limit)
+
+            recent_last_seen: dict[tuple[str, str], datetime | None] = {}
+            for r in recent_rows:
+                key = self._norm_message_key(r.direction, r.text)
+                dt = self._parse_iso(getattr(r, "observed_at_utc", None))
+                prev = recent_last_seen.get(key)
+                if prev is None or (dt is not None and prev is not None and dt > prev):
+                    recent_last_seen[key] = dt
+
+            now_dt = self._parse_iso(observed_at_utc) or datetime.now(timezone.utc)
+
+            filtered: list[tuple[str, str]] = []
+            batch_seen: set[tuple[str, str]] = set()
+            for d, t in new_tail:
+                key = self._norm_message_key(d, t)
+                if key in batch_seen:
+                    continue
+                batch_seen.add(key)
+
+                last_dt = recent_last_seen.get(key)
+                if last_dt is not None:
+                    age_sec = (now_dt - last_dt).total_seconds()
+                else:
+                    age_sec = None
+
+                text_len = len((t or "").strip())
+                # Outgoing: never re-insert the same (direction,text) within a day.
+                if key[0] == "outgoing" and age_sec is not None and age_sec <= 86400:
+                    continue
+                # Incoming: short messages are allowed to repeat, but not within a rapid-poll window.
+                if key[0] == "incoming" and age_sec is not None:
+                    if text_len <= 12 and age_sec <= 15 * 60:
+                        continue
+                    if text_len > 12 and age_sec <= 6 * 3600:
+                        continue
+
+                filtered.append((d, t))
+            new_tail = filtered
+        except Exception:  # noqa: BLE001
+            # If anything goes wrong, fall back to the overlap-based new_tail.
+            pass
+
         if not new_tail:
             return 0
 

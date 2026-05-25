@@ -61,6 +61,10 @@ def _is_ignored_text(text: str) -> bool:
         "active",
         "typing...",
         "message",
+        # Inbox/thread UI labels that are not actual messages.
+        "unread",
+        "new messages",
+        "new message",
     }
     if lowered in ignored_exact:
         return True
@@ -82,6 +86,9 @@ def _is_ignored_text(text: str) -> bool:
     if re.fullmatch(r"\d{1,3}[smhdw]", lowered):
         return True
     if re.fullmatch(r"\d{1,2}:\d{2}", lowered):
+        return True
+    # 12-hour clock labels sometimes appear as their own rows (e.g. "1:48 AM").
+    if re.fullmatch(r"\d{1,2}:\d{2}\s*(?:am|pm|a\.?m\.?|p\.?m\.?)", lowered):
         return True
     if re.fullmatch(r"\d{1,3}\s*(sec|secs|second|seconds|min|mins|minute|minutes|hr|hrs|hour|hours|day|days|week|weeks)", lowered):
         return True
@@ -117,6 +124,48 @@ def _safe_rect(el) -> dict | None:
         return None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _get_thread_header_texts(driver) -> set[str]:
+    """Best-effort collection of thread header texts (username/title).
+
+    These can sometimes appear in the same pane and get picked up by the broad
+    bubble/text XPaths. We ignore exact matches (case-insensitive) to avoid
+    polluting history with non-message UI rows.
+    """
+
+    xpaths = [
+        f"{MAIN_CONTAINER_XPATH}//header//*[self::h1 or self::h2][normalize-space()]",
+        f"{MAIN_CONTAINER_XPATH}//header//span[normalize-space()]",
+        f"{MAIN_CONTAINER_XPATH}//header//div[normalize-space()]",
+    ]
+
+    out: set[str] = set()
+    for xp in xpaths:
+        try:
+            els = driver.find_elements(By.XPATH, xp)
+        except Exception:  # noqa: BLE001
+            els = []
+
+        for el in els:
+            text = _safe_text(el)
+            if not text:
+                continue
+            norm = _normalize_text(text)
+            if not norm:
+                continue
+            if _is_ignored_text(norm):
+                continue
+            lowered = norm.lower()
+            # Keep header candidates reasonably short to avoid catching large blocks.
+            if 1 < len(lowered) <= 60:
+                out.add(lowered)
+
+        if out:
+            # Prefer earlier/stronger header signals; if we found any, that's enough.
+            break
+
+    return out
 
 
 def _classify_direction(main_mid_x: float, bubble_rect: dict, margin_px: float = 30.0) -> str:
@@ -320,7 +369,8 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
         cw = float(composer_rect.get("width", 0.0))
         pane_mid_x = cx + cw / 2.0
         # Allow some slack so bubbles just above/around the composer are included.
-        x_filter_min = cx - 250.0
+        # Keep the left slack tight to avoid accidentally reading the left sidebar.
+        x_filter_min = cx - 80.0
         x_filter_max = cx + cw + 250.0
     else:
         try:
@@ -344,10 +394,27 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
 
     raw: list[tuple[str, str, float]] = []
 
+    header_ignored = set()
+    try:
+        header_ignored = _get_thread_header_texts(driver)
+    except Exception:  # noqa: BLE001
+        header_ignored = set()
+
     def add_candidate(text: str, rect: dict) -> None:
         norm = _normalize_text(text)
         if not norm or _is_ignored_text(norm):
             return
+
+        # Avoid treating the thread header username/title as a message.
+        if header_ignored and norm.lower() in header_ignored:
+            # Only ignore if it appears near the top of the viewport where headers live.
+            # This avoids dropping real messages that happen to equal the username.
+            try:
+                y = float(rect.get("y", 0.0))
+            except Exception:  # noqa: BLE001
+                y = 0.0
+            if y <= 200.0:
+                return
 
         # If we found a composer, only accept candidates that visually live in the same pane.
         # This avoids accidentally reading thread previews from the left sidebar.

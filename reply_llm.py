@@ -4,6 +4,7 @@ import json
 import hashlib
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -13,6 +14,58 @@ from typing import Any
 from state_store import ThreadMessage
 
 LOGGER = logging.getLogger(__name__)
+
+
+_LEADING_ISO_TS = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\]\s*"
+)
+
+_NOISE_AGE_LABEL = re.compile(r"^\d{1,3}[smhdw]$", re.IGNORECASE)
+_NOISE_24H_TIME = re.compile(r"^\d{1,2}:\d{2}$", re.IGNORECASE)
+_NOISE_12H_TIME = re.compile(r"^\d{1,2}:\d{2}\s*(?:am|pm|a\.?m\.?|p\.?m\.?)$", re.IGNORECASE)
+_NOISE_DURATION = re.compile(
+    r"^\d{1,3}\s*(sec|secs|second|seconds|min|mins|minute|minutes|hr|hrs|hour|hours|day|days|week|weeks)$",
+    re.IGNORECASE,
+)
+
+_USERNAME_LIKE = re.compile(r"^[a-z0-9._]{3,40}$", re.IGNORECASE)
+
+
+def _is_noise_prompt_content(text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized:
+        return True
+
+    lowered = normalized.lower()
+    if lowered in {
+        # UI headers/labels we've observed being extracted as messages.
+        "unread",
+        "new messages",
+        "new message",
+        # Delivery/status labels that are not part of the conversation.
+        "seen",
+        "seen just now",
+        "sent",
+        "delivered",
+        "active",
+        "message",
+    }:
+        return True
+
+    if _NOISE_AGE_LABEL.fullmatch(normalized):
+        return True
+    if _NOISE_24H_TIME.fullmatch(normalized):
+        return True
+    if _NOISE_12H_TIME.fullmatch(normalized):
+        return True
+    if _NOISE_DURATION.fullmatch(normalized):
+        return True
+
+    return False
+
+
+def _strip_leading_timestamp_prefix(text: str) -> str:
+    return _LEADING_ISO_TS.sub("", text or "", count=1)
 
 
 def _safe_thread_tag(thread_url: str) -> str:
@@ -68,15 +121,15 @@ def _as_bool(value: object) -> bool:
 
 
 def _format_message_content(msg: ThreadMessage) -> str:
-    ts = (msg.observed_at_utc or "").strip()
     text = (msg.text or "").strip()
-    if ts:
-        return f"[{ts}] {text}"
-    return text
+    return _strip_leading_timestamp_prefix(text)
 
 
-def _to_chat_messages(history: list[ThreadMessage]) -> list[dict[str, str]]:
+def _to_chat_messages(history: list[ThreadMessage], *, own_username: str | None = None) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
+    seen_assistant_long: set[str] = set()
+    seen_user_short: set[str] = set()
+    own_u = (own_username or "").strip().lstrip("@").lower()
     for msg in history:
         direction = (msg.direction or "").strip().lower()
         if direction == "incoming":
@@ -86,7 +139,35 @@ def _to_chat_messages(history: list[ThreadMessage]) -> list[dict[str, str]]:
         else:
             # v1: drop unknown direction messages to avoid confusing the model.
             continue
-        out.append({"role": role, "content": _format_message_content(msg)})
+
+        content = _format_message_content(msg)
+        if _is_noise_prompt_content(content):
+            continue
+
+        # Backstop: sometimes the thread header username leaks into history as a standalone
+        # token. Avoid sending such rows to the LLM.
+        if role == "user":
+            compact = "".join((content or "").split())
+            if own_u and compact.lower().lstrip("@") == own_u:
+                continue
+            if compact and _USERNAME_LIKE.fullmatch(compact) and ("_" in compact or "." in compact):
+                continue
+
+            # If DB history is polluted with rapid-poll duplicates, collapse repeated short
+            # user texts to a single occurrence to keep prompts readable.
+            if len(content) <= 40:
+                if content in seen_user_short:
+                    continue
+                seen_user_short.add(content)
+
+        # If DB history is already polluted with duplicated outgoing replies, keep only the
+        # first occurrence of long assistant messages to avoid confusing the model.
+        if role == "assistant" and len(content) >= 20:
+            if content in seen_assistant_long:
+                continue
+            seen_assistant_long.add(content)
+
+        out.append({"role": role, "content": content})
     return out
 
 
@@ -132,7 +213,7 @@ def generate_reply(history: list[ThreadMessage], settings, *, fallback: str) -> 
     messages: list[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    messages.extend(_to_chat_messages(history))
+    messages.extend(_to_chat_messages(history, own_username=getattr(settings, "ig_username", None)))
 
     payload: dict[str, Any] = {
         "model": model_for_dump,
@@ -181,7 +262,7 @@ def generate_reply(history: list[ThreadMessage], settings, *, fallback: str) -> 
         msg = choice0.get("message") or {}
         content = (msg.get("content") or "").strip()
         if content:
-            return content
+            return _strip_leading_timestamp_prefix(content)
         LOGGER.warning("LLM response missing content; using fallback")
         return fallback_text
     except urllib.error.HTTPError as e:

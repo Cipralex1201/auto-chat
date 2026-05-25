@@ -177,6 +177,27 @@ class BotScheduler:
             incoming_msg_id = int(latest_in.id)
             incoming_text = (latest_in.text or "").strip()
 
+            own_u = (getattr(self.settings, "ig_username", "") or "").strip().lstrip("@").lower()
+            if own_u and incoming_text.strip().lstrip("@").lower() == own_u:
+                LOGGER.info("Skipping: latest incoming equals own username (UI leak) (thread=%s)", snap.thread_url)
+                # Mark as replied-to so it cannot trigger reply spam.
+                self.store.upsert_thread_state(
+                    thread_url=snap.thread_url,
+                    last_seen_fingerprint=snap.message_fingerprint,
+                    last_seen_text=snap.message_text,
+                    last_activity_utc=snap.observed_at_utc,
+                    first_reply_sent=state.first_reply_sent,
+                    last_replied_incoming_fingerprint=getattr(snap, "latest_incoming_fingerprint", None),
+                    last_replied_incoming_text=incoming_text,
+                    last_reply_utc=state.last_reply_utc,
+                    last_replied_incoming_msg_id=incoming_msg_id,
+                    last_attempt_incoming_fingerprint=None,
+                    last_attempt_utc=None,
+                    last_attempt_incoming_msg_id=None,
+                    attempt_count=0,
+                )
+                continue
+
             if state.last_replied_incoming_msg_id == incoming_msg_id:
                 LOGGER.debug("Incoming already replied-to (msg_id=%s); no reply (thread=%s)", incoming_msg_id, snap.thread_url)
                 continue
