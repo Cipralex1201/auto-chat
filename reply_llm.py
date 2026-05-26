@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -179,6 +180,33 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeo
     return json.loads(body)
 
 
+def _is_retryable_network_error(exc: BaseException) -> bool:
+    """Return True for transient connectivity-ish failures worth retrying.
+
+    Intentionally does NOT retry HTTP status errors (HTTPError).
+    """
+
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return True
+        if isinstance(reason, OSError) and reason.errno in {101, 110, 111, 113}:
+            return True
+        # DNS failures and other URL-related connection errors are usually safe to retry.
+        return True
+
+    if isinstance(exc, OSError) and exc.errno in {101, 110, 111, 113}:
+        return True
+
+    return False
+
+
 def generate_reply(history: list[ThreadMessage], settings, *, fallback: str) -> str:
     """Generate a reply using an OpenAI-compatible Chat Completions API.
 
@@ -257,7 +285,39 @@ def generate_reply(history: list[ThreadMessage], settings, *, fallback: str) -> 
     payload["model"] = real_model
 
     try:
-        result = _post_json(url, headers, payload, timeout_sec=timeout_sec)
+        retry_n = int(getattr(settings, "llm_retry_n", 2))
+        backoff_base_sec = float(getattr(settings, "llm_retry_backoff_base_sec", 1.0))
+
+        attempts_total = 1 + max(0, retry_n)
+        result: dict[str, Any] | None = None
+        last_exc: BaseException | None = None
+
+        for attempt_idx in range(attempts_total):
+            try:
+                result = _post_json(url, headers, payload, timeout_sec=timeout_sec)
+                last_exc = None
+                break
+            except Exception as e:  # noqa: BLE001
+                if _is_retryable_network_error(e) and attempt_idx < attempts_total - 1:
+                    delay = max(0.0, backoff_base_sec) * (2**attempt_idx)
+                    LOGGER.warning(
+                        "LLM network error (attempt %s/%s): %s; retrying in %.1fs",
+                        attempt_idx + 1,
+                        attempts_total,
+                        repr(e),
+                        delay,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                last_exc = e
+                break
+
+        if last_exc is not None:
+            raise last_exc
+        if result is None:
+            raise RuntimeError("LLM call failed with no exception")
+
         choice0 = (result.get("choices") or [{}])[0]
         msg = choice0.get("message") or {}
         content = (msg.get("content") or "").strip()

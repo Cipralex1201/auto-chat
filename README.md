@@ -42,6 +42,15 @@ Set `LLM_DEBUG_DUMP_PROMPTS=true` to write the exact JSON payload (system prompt
 
 If you only want to validate prompt assembly (no network request), also set `LLM_DEBUG_DUMP_ONLY=true`.
 
+## LLM network retries
+
+If the LLM request fails due to transient network issues (DNS failure, timeout, no route to host), the bot will retry a couple times with exponential backoff before falling back to `DRY_RUN_REPLY_TEXT`.
+
+Configure via:
+
+- `LLM_RETRY_N` (default: 2) — number of extra retries after the first attempt
+- `LLM_RETRY_BACKOFF_BASE_SEC` (default: 1) — base seconds for exponential backoff (1s, 2s, 4s, ...)
+
 ## Timing Model
 
 Configured in `.env` (defaults already match your requested ranges):
