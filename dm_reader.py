@@ -6,6 +6,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.common.by import By
@@ -127,7 +128,6 @@ def _safe_rect(el) -> dict | None:
 
 
 _USERNAME_LIKE = re.compile(r"^[a-z0-9._]{3,40}$")
-_HANDLE_IN_URL = re.compile(r"(?:^|/)([a-z0-9._]{3,40})(?:/|$)")
 
 
 def _looks_like_ig_handle(text: str) -> bool:
@@ -165,18 +165,33 @@ def _extract_handle_from_href(href: str | None) -> str | None:
     # - /adamgyory/
     s = s.split("?", 1)[0].split("#", 1)[0]
 
-    # Avoid direct-message URLs.
-    if "/direct/" in s:
+    try:
+        parsed = urlparse(s)
+        path = parsed.path if (parsed.scheme or parsed.netloc) else s
+    except Exception:  # noqa: BLE001
+        path = s
+
+    if not path:
+        return None
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    # Avoid direct-message URLs or other multi-segment paths.
+    if "/direct/" in path:
         return None
 
-    m = _HANDLE_IN_URL.search(s)
-    if not m:
+    segments = [seg for seg in path.split("/") if seg]
+    if len(segments) != 1:
         return None
-    handle = (m.group(1) or "").strip().lower()
+
+    handle = (segments[0] or "").strip().lower()
     if not handle:
+        return None
+    if handle in {"p", "reel", "reels", "stories", "explore", "accounts", "direct", "about", "privacy", "terms"}:
         return None
     if _USERNAME_LIKE.fullmatch(handle) is None:
         return None
+
     return handle
 
 
@@ -222,6 +237,23 @@ def _get_thread_header_info(driver) -> tuple[set[str], set[str], float | None]:
         handle = _extract_handle_from_href(href)
         if handle:
             header_handles.add(handle)
+
+    # Fallback: sometimes profile links appear outside <header> (e.g. in live/typing UI),
+    # but they still tend to be single-segment handle paths like "/adamgyory/".
+    if not header_handles:
+        try:
+            links = driver.find_elements(By.XPATH, f"{MAIN_CONTAINER_XPATH}//a[@href]")
+        except Exception:  # noqa: BLE001
+            links = []
+        for a in links:
+            try:
+                href = a.get_attribute("href")
+            except Exception:  # noqa: BLE001
+                href = None
+            handle = _extract_handle_from_href(href)
+            if handle:
+                header_handles.add(handle)
+                break
 
     for xp in xpaths:
         try:
