@@ -71,6 +71,19 @@ Configured in `.env` (defaults already match your requested ranges):
 - Conversation expiry for active mode: `CONVERSATION_EXPIRE_MIN_SEC` to `CONVERSATION_EXPIRE_MAX_SEC` (480-720)
 - Optional skip probability: `SKIP_REPLY_PROBABILITY` (default 0.20)
 
+## Quiet Hours (Hard Idle Windows)
+
+If you want the bot to be fully idle during certain times of day (no chat responses, no browser, no inbox checking), configure `IDLE_WINDOWS_LOCAL`.
+
+Examples:
+
+- Fully idle roughly from 1AM to 8AM (with some randomness):
+	- `IDLE_WINDOWS_LOCAL=01:00-08:00`
+	- `IDLE_WINDOWS_START_JITTER_MIN=20`
+	- `IDLE_WINDOWS_END_JITTER_MIN=20`
+
+During these windows the scheduler closes Selenium and sleeps efficiently until the window ends.
+
 ## Browser Lifetime Strategy
 
 To reduce memory leak accumulation while preserving responsiveness:

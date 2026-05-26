@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from browser import BrowserManager
 from config import Settings
 from dm_reader import ThreadSnapshot, read_watched_threads
+from idle_windows import DailyIdleWindows
 from reply_llm import generate_reply
 from sender import send_message
 from session import login_if_needed
@@ -36,6 +37,12 @@ class BotScheduler:
         self.browser = browser
         self.store = store
         self.mode_state = ModeState()
+
+        self.idle_windows = DailyIdleWindows(
+            getattr(self.settings, "idle_windows", []) or [],
+            start_jitter_min=int(getattr(self.settings, "idle_windows_start_jitter_min", 0) or 0),
+            end_jitter_min=int(getattr(self.settings, "idle_windows_end_jitter_min", 0) or 0),
+        )
 
     @staticmethod
     def _norm_space(text: str) -> str:
@@ -491,6 +498,23 @@ class BotScheduler:
     def run_forever(self) -> None:
         LOGGER.info("Scheduler started at %s", datetime.now(timezone.utc).isoformat())
         while True:
+            # Hard idle windows ("quiet hours"): no browser, no inbox checks, sleep efficiently.
+            if self.idle_windows.enabled:
+                now_local = datetime.now().astimezone()
+                quiet_until = self.idle_windows.current_window_end(now_local)
+                if quiet_until is not None:
+                    if self.mode_state.mode != "quiet":
+                        LOGGER.info("Entering QUIET window; idling until %s", quiet_until.isoformat())
+                    self.mode_state.mode = "quiet"
+                    if self.browser is not None:
+                        self.browser.close()
+                    sleep_for = max(1, int((quiet_until - now_local).total_seconds()))
+                    time.sleep(sleep_for)
+                    continue
+                if self.mode_state.mode == "quiet":
+                    LOGGER.info("Exiting QUIET window; resuming normal scheduler")
+                    self.mode_state.mode = "idle"
+
             self._maybe_exit_active_mode()
 
             try:

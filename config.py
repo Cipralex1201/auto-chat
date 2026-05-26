@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from idle_windows import WindowSpec, parse_idle_windows
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -70,6 +72,12 @@ class Settings:
     ig_ignore_exact_username: str
     ig_ignore_exact_fullname: str
 
+    # Daily idle windows (local time) during which the bot does nothing.
+    # Example: "01:00-08:00,13:00-14:00".
+    idle_windows: list[WindowSpec]
+    idle_windows_start_jitter_min: int
+    idle_windows_end_jitter_min: int
+
 
 def _get_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -106,6 +114,9 @@ def _parse_optional_path(raw: str | None) -> Path | None:
 
 def load_settings() -> Settings:
     load_dotenv()
+
+    idle_windows_raw = os.getenv("IDLE_WINDOWS_LOCAL", "").strip()
+    idle_windows = parse_idle_windows(idle_windows_raw)
 
     settings = Settings(
         ig_username=os.getenv("IG_USERNAME", "").strip(),
@@ -154,6 +165,10 @@ def load_settings() -> Settings:
 
         ig_ignore_exact_username=os.getenv("IG_IGNORE_EXACT_USERNAME", "").strip(),
         ig_ignore_exact_fullname=os.getenv("IG_IGNORE_EXACT_FULLNAME", "").strip(),
+
+        idle_windows=idle_windows,
+        idle_windows_start_jitter_min=_get_int("IDLE_WINDOWS_START_JITTER_MIN", 0),
+        idle_windows_end_jitter_min=_get_int("IDLE_WINDOWS_END_JITTER_MIN", 0),
     )
 
     if settings.idle_min_sec > settings.idle_max_sec:
@@ -183,5 +198,10 @@ def load_settings() -> Settings:
         raise ValueError("LLM_RETRY_BACKOFF_BASE_SEC must be >= 0")
     if settings.max_stored_messages_per_thread < 0:
         raise ValueError("MAX_STORED_MESSAGES_PER_THREAD must be >= 0")
+
+    if settings.idle_windows_start_jitter_min < 0:
+        raise ValueError("IDLE_WINDOWS_START_JITTER_MIN must be >= 0")
+    if settings.idle_windows_end_jitter_min < 0:
+        raise ValueError("IDLE_WINDOWS_END_JITTER_MIN must be >= 0")
 
     return settings
