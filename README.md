@@ -42,6 +42,15 @@ Set `LLM_DEBUG_DUMP_PROMPTS=true` to write the exact JSON payload (system prompt
 
 If you only want to validate prompt assembly (no network request), also set `LLM_DEBUG_DUMP_ONLY=true`.
 
+## Guard: ignore thread caption text
+
+Instagram sometimes re-renders the thread caption (username + display name) inside the message pane, which can be misread as a new message.
+
+To hard-ignore those exact strings, set these in `.env`:
+
+- `IG_IGNORE_EXACT_USERNAME` — the thread caption username/handle (with or without `@`)
+- `IG_IGNORE_EXACT_FULLNAME` — the thread caption display name (full name)
+
 ## LLM network retries
 
 If the LLM request fails due to transient network issues (DNS failure, timeout, no route to host), the bot will retry a couple times with exponential backoff before falling back to `DRY_RUN_REPLY_TEXT`.

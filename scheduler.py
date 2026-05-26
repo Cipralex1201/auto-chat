@@ -37,6 +37,31 @@ class BotScheduler:
         self.store = store
         self.mode_state = ModeState()
 
+    @staticmethod
+    def _norm_space(text: str) -> str:
+        return " ".join((text or "").strip().split())
+
+    def _is_ignored_exact_text(self, text: str) -> bool:
+        """Return True if `text` should be ignored as UI caption/header junk."""
+
+        candidate = self._norm_space(text)
+        if not candidate:
+            return False
+
+        # Username/handle comparison (ignore leading '@', case-insensitive).
+        ignore_u = self._norm_space(getattr(self.settings, "ig_ignore_exact_username", ""))
+        if ignore_u:
+            if candidate.lstrip("@").casefold() == ignore_u.lstrip("@").casefold():
+                return True
+
+        # Full-name/display-name comparison (whitespace-normalized, case-insensitive).
+        ignore_full = self._norm_space(getattr(self.settings, "ig_ignore_exact_fullname", ""))
+        if ignore_full:
+            if candidate.casefold() == ignore_full.casefold():
+                return True
+
+        return False
+
     def _rand_idle_interval(self) -> int:
         return random.randint(self.settings.idle_min_sec, self.settings.idle_max_sec)
 
@@ -123,9 +148,12 @@ class BotScheduler:
 
             # Persist tail window into message history (idempotent overlap update).
             try:
+                tail_messages = getattr(snap, "tail_messages", []) or []
+                if tail_messages:
+                    tail_messages = [(d, t) for d, t in tail_messages if not self._is_ignored_exact_text(t)]
                 self.store.update_history_from_tail(
                     snap.thread_url,
-                    getattr(snap, "tail_messages", []) or [],
+                    tail_messages,
                     snap.observed_at_utc,
                     max_per_thread=max_store,
                 )
@@ -176,6 +204,29 @@ class BotScheduler:
 
             incoming_msg_id = int(latest_in.id)
             incoming_text = (latest_in.text or "").strip()
+
+            if self._is_ignored_exact_text(incoming_text):
+                LOGGER.info(
+                    "Skipping: latest incoming matches ignored caption/header text (thread=%s)",
+                    snap.thread_url,
+                )
+                # Mark as replied-to so it cannot trigger reply spam.
+                self.store.upsert_thread_state(
+                    thread_url=snap.thread_url,
+                    last_seen_fingerprint=snap.message_fingerprint,
+                    last_seen_text=snap.message_text,
+                    last_activity_utc=snap.observed_at_utc,
+                    first_reply_sent=state.first_reply_sent,
+                    last_replied_incoming_fingerprint=getattr(snap, "latest_incoming_fingerprint", None),
+                    last_replied_incoming_text=incoming_text,
+                    last_reply_utc=state.last_reply_utc,
+                    last_replied_incoming_msg_id=incoming_msg_id,
+                    last_attempt_incoming_fingerprint=None,
+                    last_attempt_utc=None,
+                    last_attempt_incoming_msg_id=None,
+                    attempt_count=0,
+                )
+                continue
 
             own_u = (getattr(self.settings, "ig_username", "") or "").strip().lstrip("@").lower()
             if own_u and incoming_text.strip().lstrip("@").lower() == own_u:

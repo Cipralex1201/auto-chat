@@ -64,6 +64,12 @@ class Settings:
     # Storage bound
     max_stored_messages_per_thread: int
 
+    # Message recognition guards
+    # If IG's UI header/caption (username or display name) gets misread as a message,
+    # ignore exact matches for these strings.
+    ig_ignore_exact_username: str
+    ig_ignore_exact_fullname: str
+
 
 def _get_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -145,6 +151,9 @@ def load_settings() -> Settings:
         llm_debug_dump_only=_get_bool("LLM_DEBUG_DUMP_ONLY", "false"),
 
         max_stored_messages_per_thread=_get_int("MAX_STORED_MESSAGES_PER_THREAD", 1000),
+
+        ig_ignore_exact_username=os.getenv("IG_IGNORE_EXACT_USERNAME", "").strip(),
+        ig_ignore_exact_fullname=os.getenv("IG_IGNORE_EXACT_FULLNAME", "").strip(),
     )
 
     if settings.idle_min_sec > settings.idle_max_sec:
