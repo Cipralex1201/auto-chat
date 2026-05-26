@@ -9,3 +9,4 @@ venv/
 state.sqlite3
 logs/
 master_prompt.txt
+*.sqlite3

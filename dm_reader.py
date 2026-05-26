@@ -127,6 +127,7 @@ def _safe_rect(el) -> dict | None:
 
 
 _USERNAME_LIKE = re.compile(r"^[a-z0-9._]{3,40}$")
+_HANDLE_IN_URL = re.compile(r"(?:^|/)([a-z0-9._]{3,40})(?:/|$)")
 
 
 def _looks_like_ig_handle(text: str) -> bool:
@@ -149,6 +150,34 @@ def _looks_like_ig_handle(text: str) -> bool:
         return False
 
     return _USERNAME_LIKE.fullmatch(compact) is not None
+
+
+def _extract_handle_from_href(href: str | None) -> str | None:
+    if not href:
+        return None
+    s = (href or "").strip()
+    if not s:
+        return None
+
+    # Support both absolute and relative hrefs.
+    # Examples:
+    # - https://www.instagram.com/adamgyory/
+    # - /adamgyory/
+    s = s.split("?", 1)[0].split("#", 1)[0]
+
+    # Avoid direct-message URLs.
+    if "/direct/" in s:
+        return None
+
+    m = _HANDLE_IN_URL.search(s)
+    if not m:
+        return None
+    handle = (m.group(1) or "").strip().lower()
+    if not handle:
+        return None
+    if _USERNAME_LIKE.fullmatch(handle) is None:
+        return None
+    return handle
 
 
 def _get_thread_header_info(driver) -> tuple[set[str], set[str], float | None]:
@@ -179,6 +208,20 @@ def _get_thread_header_info(driver) -> tuple[set[str], set[str], float | None]:
 
     header_texts: set[str] = set()
     header_handles: set[str] = set()
+
+    # Strong signal: the header often contains a profile link with the handle in the href.
+    try:
+        links = driver.find_elements(By.XPATH, f"{MAIN_CONTAINER_XPATH}//header//a[@href]")
+    except Exception:  # noqa: BLE001
+        links = []
+    for a in links:
+        try:
+            href = a.get_attribute("href")
+        except Exception:  # noqa: BLE001
+            href = None
+        handle = _extract_handle_from_href(href)
+        if handle:
+            header_handles.add(handle)
 
     for xp in xpaths:
         try:
@@ -441,10 +484,12 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
     header_texts: set[str] = set()
     header_handles: set[str] = set()
     header_bottom_y: float | None = None
+    header_fullnames: set[str] = set()
     try:
         header_texts, header_handles, header_bottom_y = _get_thread_header_info(driver)
     except Exception:  # noqa: BLE001
         header_texts, header_handles, header_bottom_y = set(), set(), None
+    header_fullnames = {t for t in header_texts if " " in t}
 
     def add_candidate(text: str, rect: dict) -> None:
         norm = _normalize_text(text)
@@ -457,6 +502,12 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
         # Robust behavior: ignore handle-like header strings wherever they appear,
         # because IG sometimes re-renders them lower in the pane during active updates.
         if header_handles and lowered in header_handles:
+            return
+
+        # Display names / full names in the caption often contain spaces (e.g. "Győry Ádám").
+        # IG may re-render these anywhere in the pane while the other person is active.
+        # Robust behavior: drop them unconditionally to avoid polluting history.
+        if header_fullnames and norm.lower() in header_fullnames:
             return
 
         # For other header strings (e.g. display name), be conservative: ignore only
