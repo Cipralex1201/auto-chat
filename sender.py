@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import InvalidArgumentException, StaleElementReferenceException, TimeoutException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -39,11 +39,78 @@ def send_message(driver, text: str) -> bool:
         pass
 
     def _read_composer_text(el) -> str:
+        """Read composer text in a way that's resilient to driver JSON-escape bugs.
+
+        Some Firefox/GeckoDriver combinations can throw `InvalidArgumentException`
+        (e.g. "unexpected end of hex escape") when returning raw element text that
+        contains certain backslash/escape-like sequences. We fall back to a
+        hex-encoded UTF-8 read via JS to keep the returned JSON safe.
+        """
+
+        def _read_via_safe_hex_js() -> str:
+            try:
+                hex_str = driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    const text = (el && (el.textContent ?? '')) || '';
+                    // Encode to UTF-8 bytes, then return a hex string (JSON-safe).
+                    let bytes;
+                    try {
+                      bytes = new TextEncoder().encode(text);
+                    } catch (e) {
+                      // Older engines: encodeURIComponent returns UTF-8 percent-escapes.
+                      const enc = encodeURIComponent(text);
+                      const out = [];
+                      for (let i = 0; i < enc.length; i++) {
+                        const ch = enc[i];
+                        if (ch === '%') {
+                          out.push(parseInt(enc.slice(i + 1, i + 3), 16));
+                          i += 2;
+                        } else {
+                          out.push(ch.charCodeAt(0));
+                        }
+                      }
+                      bytes = out;
+                    }
+                    let hex = '';
+                    for (let i = 0; i < bytes.length; i++) {
+                      hex += bytes[i].toString(16).padStart(2, '0');
+                    }
+                    return hex;
+                    """,
+                    el,
+                )
+                if not isinstance(hex_str, str):
+                    return ""
+                hex_str = hex_str.strip()
+                if not hex_str:
+                    return ""
+                if len(hex_str) % 2 != 0:
+                    return ""
+                return bytes.fromhex(hex_str).decode("utf-8", errors="replace").strip()
+            except Exception:  # noqa: BLE001
+                return ""
+
         try:
-            # contenteditable composer
+            # Fast path for typical drivers.
             return (el.get_attribute("textContent") or "").strip()
+        except InvalidArgumentException:
+            safe = _read_via_safe_hex_js()
+            if safe:
+                return safe
         except Exception:  # noqa: BLE001
+            pass
+
+        try:
             return (el.text or "").strip()
+        except InvalidArgumentException:
+            safe = _read_via_safe_hex_js()
+            if safe:
+                return safe
+        except Exception:  # noqa: BLE001
+            pass
+
+        return ""
 
     def _normalize(s: str) -> str:
         return " ".join((s or "").strip().split()).lower()
