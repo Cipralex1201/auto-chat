@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from selenium.common.exceptions import InvalidArgumentException, StaleElementReferenceException, TimeoutException
@@ -14,7 +15,9 @@ LOGGER = logging.getLogger(__name__)
 
 
 def send_message(driver, text: str) -> bool:
-    message = (text or "").strip()
+    # IMPORTANT: Instagram DMs treat Enter as "send". Multi-line content increases
+    # the chance of partial sends or focus churn. Normalize to a single line.
+    message = re.sub(r"\s+", " ", (text or "")).strip()
     if not message:
         LOGGER.warning("Refusing to send empty message")
         return False
@@ -255,45 +258,79 @@ def send_message(driver, text: str) -> bool:
     def _js_clear_composer(el) -> None:
         _js_set_composer_text(el, "")
 
-    def _type_message(el, message_text: str) -> None:
-        # Instagram often re-renders the composer on the first keystroke. If we keep
-        # using the old WebElement reference, subsequent keys can go nowhere.
-        _focus(el)
-
-        def _active_editable_or_refocus() -> object:
-            active = driver.switch_to.active_element
-            active = _resolve_edit_target(active)
-            if not _is_editable(active):
-                _focus(el)
-                active = driver.switch_to.active_element
-                active = _resolve_edit_target(active)
-            return active
-
-        # Clear on the *current* active element.
-        try:
-            active = _active_editable_or_refocus()
-            active.send_keys(Keys.CONTROL, "a")
-            active.send_keys(Keys.BACKSPACE)
-        except Exception:  # noqa: BLE001
-            pass
-
-        # Type character-by-character, always targeting the current active element.
-        for ch in message_text:
+    def _find_ordered_candidates() -> list:
+        gathered: list = []
+        for xpath in candidates:
             try:
-                active = _active_editable_or_refocus()
-                active.send_keys(ch)
-            except StaleElementReferenceException:
-                # Re-render in the middle of typing; just continue.
-                continue
+                gathered.extend(driver.find_elements(By.XPATH, xpath))
             except Exception:  # noqa: BLE001
-                # Try once more after refocus.
+                continue
+        ordered_local = _pick_best_candidate(gathered)
+        if ordered_local:
+            return ordered_local
+        # As a last resort, use the first clickable candidate from the original list.
+        for xpath in candidates:
+            try:
+                return [wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))]
+            except TimeoutException as exc:
+                nonlocal_last_error[0] = exc
+                continue
+        return []
+
+    def _send_enter_on_best_effort(target_el) -> None:
+        try:
+            target_el.send_keys(Keys.ENTER)
+            return
+        except StaleElementReferenceException:
+            pass
+        # Try active element as a fallback.
+        driver.switch_to.active_element.send_keys(Keys.ENTER)
+
+    def _set_text_js_and_send_once() -> bool:
+        ordered_local = _find_ordered_candidates()
+        if not ordered_local:
+            return False
+        for composer_el in ordered_local[:2]:
+            try:
+                composer_el = _resolve_edit_target(composer_el)
+                _focus(composer_el)
+                _js_clear_composer(composer_el)
+
+                js_after = _js_set_composer_text(composer_el, message)
+                composed = (js_after or "").strip() or _read_composer_text(composer_el)
+
+                if _normalize(composed) != _normalize(message):
+                    last_error_local = ValueError("composer_mismatch")
+                    nonlocal_last_error[0] = last_error_local
+                    continue
+
+                _send_enter_on_best_effort(composer_el)
+
+                # Best-effort success signal: composer should clear shortly after send.
+                def _composer_cleared(_drv) -> bool:
+                    try:
+                        ordered2 = _find_ordered_candidates()
+                        if not ordered2:
+                            return True
+                        el2 = _resolve_edit_target(ordered2[0])
+                        return _normalize(_read_composer_text(el2)) == ""
+                    except Exception:  # noqa: BLE001
+                        return False
+
                 try:
-                    _focus(el)
-                    active = _active_editable_or_refocus()
-                    active.send_keys(ch)
+                    WebDriverWait(driver, 3).until(_composer_cleared)
                 except Exception:  # noqa: BLE001
+                    # Not a hard failure; sometimes IG delays clearing.
                     pass
-            time.sleep(0.06)
+
+                return True
+            except StaleElementReferenceException as exc:
+                nonlocal_last_error[0] = exc
+                continue
+            except Exception as exc:  # noqa: BLE001
+                nonlocal_last_error[0] = exc
+                continue
+        return False
 
     def _is_editable(el) -> bool:
         try:
@@ -329,82 +366,22 @@ def send_message(driver, text: str) -> bool:
         scored.sort(key=lambda t: t[0], reverse=True)
         return [el for _, el in scored]
 
-    # Gather candidates (across xpaths) then try best (bottom-most) first.
-    gathered: list = []
-    for xpath in candidates:
-        try:
-            gathered.extend(driver.find_elements(By.XPATH, xpath))
-        except Exception:  # noqa: BLE001
-            continue
+    # We'll retry a few times, always re-finding the composer to avoid stale references.
+    nonlocal_last_error: list[Exception | None] = [None]
 
-    ordered = _pick_best_candidate(gathered)
-    if not ordered:
-        # As a last resort, use the first clickable candidate from the original list.
-        for xpath in candidates:
-            try:
-                ordered = [wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))]
-                break
-            except TimeoutException as exc:
-                last_error = exc
-                continue
+    initial_ordered = _find_ordered_candidates()
+    if initial_ordered:
+        _dump_candidates("Composer candidates (pre)", initial_ordered)
 
-    if ordered:
-        _dump_candidates("Composer candidates (pre)", ordered)
-
-    for composer in ordered[:3]:
-        try:
-            composer = _resolve_edit_target(composer)
-            _focus(composer)
-
-            # Clear using JS first to avoid stuck leftovers.
-            try:
-                _js_clear_composer(composer)
-            except Exception:  # noqa: BLE001
-                pass
-
-            _type_message(composer, message)
-            composed = _read_composer_text(composer)
-
-            # If we only got a prefix (common failure: just first character), retry once.
-            if _normalize(composed) != _normalize(message):
-                LOGGER.debug(
-                    "Composer text mismatch; retrying via active element. expected_prefix=%s got=%s",
-                    message[:20],
-                    composed[:20],
-                )
-                active = driver.switch_to.active_element
-                active = _resolve_edit_target(active)
-                _type_message(active, message)
-                composer = active
-                composed = _read_composer_text(composer)
-
-            # If we still didn't get the message into the composer, use JS fallback.
-            if _normalize(composed) != _normalize(message):
-                LOGGER.debug(
-                    "Composer still mismatched after retry; using JS fallback. expected_prefix=%s got=%s",
-                    message[:20],
-                    composed[:20],
-                )
-                js_after = _js_set_composer_text(composer, message)
-                composed = (js_after or "").strip() or _read_composer_text(composer)
-
-            LOGGER.debug("Composer contains (len=%d): %s", len(composed), composed[:80])
-            if _normalize(composed) != _normalize(message):
-                LOGGER.warning(
-                    "Refusing to send because composer mismatch persists. expected=%s got=%s",
-                    message[:40],
-                    composed[:40],
-                )
-                last_error = ValueError("composer_mismatch")
-                continue
-
-            composer.send_keys(Keys.ENTER)
+    for _ in range(3):
+        if _set_text_js_and_send_once():
             return True
-        except StaleElementReferenceException as exc:
-            last_error = exc
-            continue
+        time.sleep(0.35)
 
-    if ordered:
-        _dump_candidates("Composer candidates (post-fail)", ordered)
-    LOGGER.warning("Failed to compose/send message (last_error=%s)", type(last_error).__name__)
+    ordered_post = _find_ordered_candidates()
+    if ordered_post:
+        _dump_candidates("Composer candidates (post-fail)", ordered_post)
+
+    last_error = nonlocal_last_error[0]
+    LOGGER.warning("Failed to compose/send message (last_error=%s)", type(last_error).__name__ if last_error else "None")
     return False

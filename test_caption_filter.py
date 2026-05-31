@@ -29,6 +29,9 @@ class _DummyStore:
             last_attempt_utc=None,
             attempt_count=0,
             last_attempt_incoming_msg_id=None,
+            pending_reply_incoming_msg_id=None,
+            pending_reply_text=None,
+            pending_reply_created_utc=None,
         )
 
     def update_history_from_tail(self, thread_url: str, tail_messages, observed_at_utc: str, *, max_per_thread=None) -> int:

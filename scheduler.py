@@ -391,6 +391,16 @@ class BotScheduler:
 
             # Record attempt before sleeping/sending to reduce chance of rapid duplicates.
             attempt_count = state.attempt_count + 1 if state.last_attempt_incoming_msg_id == incoming_msg_id else 1
+
+            # If a new inbound arrives, drop any stale pending reply from the previous inbound.
+            clear_pending = (
+                state.pending_reply_incoming_msg_id is not None
+                and state.pending_reply_incoming_msg_id != incoming_msg_id
+            )
+
+            pending_reply_incoming_msg_id = None if clear_pending else state.pending_reply_incoming_msg_id
+            pending_reply_text = None if clear_pending else state.pending_reply_text
+            pending_reply_created_utc = None if clear_pending else state.pending_reply_created_utc
             self.store.upsert_thread_state(
                 thread_url=snap.thread_url,
                 last_seen_fingerprint=snap.message_fingerprint,
@@ -404,6 +414,9 @@ class BotScheduler:
                 last_attempt_utc=now_utc_iso(),
                 last_attempt_incoming_msg_id=incoming_msg_id,
                 attempt_count=attempt_count,
+                pending_reply_incoming_msg_id=pending_reply_incoming_msg_id,
+                pending_reply_text=pending_reply_text,
+                pending_reply_created_utc=pending_reply_created_utc,
             )
 
             LOGGER.info("Waiting %s sec before reply in thread: %s", delay_sec, snap.thread_url)
@@ -415,7 +428,41 @@ class BotScheduler:
                 history = self.store.get_recent_thread_messages(snap.thread_url, limit=int(history_n))
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Failed to load message history for LLM (thread=%s)", snap.thread_url)
-            reply_text = generate_reply(history, self.settings, fallback=self.settings.dry_run_reply_text)
+
+            # Reuse the same reply text when retrying a failed send.
+            if (
+                pending_reply_incoming_msg_id == incoming_msg_id
+                and (pending_reply_text or "").strip()
+            ):
+                reply_text = (pending_reply_text or "").strip()
+                LOGGER.info(
+                    "Reusing cached reply for retry (thread=%s inbound_msg_id=%s)",
+                    snap.thread_url,
+                    incoming_msg_id,
+                )
+            else:
+                reply_text = generate_reply(history, self.settings, fallback=self.settings.dry_run_reply_text)
+                # Persist pending reply immediately so future retries don't re-call the LLM.
+                try:
+                    self.store.upsert_thread_state(
+                        thread_url=snap.thread_url,
+                        last_seen_fingerprint=snap.message_fingerprint,
+                        last_seen_text=snap.message_text,
+                        last_activity_utc=snap.observed_at_utc,
+                        first_reply_sent=state.first_reply_sent,
+                        last_replied_incoming_fingerprint=state.last_replied_incoming_fingerprint,
+                        last_replied_incoming_text=state.last_replied_incoming_text,
+                        last_reply_utc=state.last_reply_utc,
+                        last_attempt_incoming_fingerprint=state.last_attempt_incoming_fingerprint,
+                        last_attempt_utc=state.last_attempt_utc,
+                        last_attempt_incoming_msg_id=state.last_attempt_incoming_msg_id,
+                        attempt_count=attempt_count,
+                        pending_reply_incoming_msg_id=incoming_msg_id,
+                        pending_reply_text=reply_text,
+                        pending_reply_created_utc=now_utc_iso(),
+                    )
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed to persist pending reply (thread=%s)", snap.thread_url)
 
             if self.settings.enable_sending:
                 ok = send_message(driver, reply_text)
@@ -458,6 +505,9 @@ class BotScheduler:
                 last_attempt_utc=None,
                 last_attempt_incoming_msg_id=None,
                 attempt_count=0,
+                pending_reply_incoming_msg_id=None,
+                pending_reply_text=None,
+                pending_reply_created_utc=None,
             )
 
         if saw_new_message:

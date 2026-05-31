@@ -40,6 +40,11 @@ class ThreadState:
 
     last_attempt_incoming_msg_id: int | None
 
+    # Cached reply to reuse when sending fails (avoid re-calling LLM).
+    pending_reply_incoming_msg_id: int | None
+    pending_reply_text: str | None
+    pending_reply_created_utc: str | None
+
 
 class StateStore:
     def __init__(self, db_path: Path) -> None:
@@ -80,6 +85,11 @@ class StateStore:
         add_col("last_attempt_utc", "TEXT")
         add_col("attempt_count", "INTEGER NOT NULL DEFAULT 0")
         add_col("last_attempt_incoming_msg_id", "INTEGER")
+
+        # Cached reply (per inbound message id).
+        add_col("pending_reply_incoming_msg_id", "INTEGER")
+        add_col("pending_reply_text", "TEXT")
+        add_col("pending_reply_created_utc", "TEXT")
 
         for stmt in migrations:
             self.conn.execute(stmt)
@@ -122,7 +132,10 @@ class StateStore:
                 last_attempt_incoming_fingerprint,
                 last_attempt_utc,
                 attempt_count,
-                last_attempt_incoming_msg_id
+                last_attempt_incoming_msg_id,
+                pending_reply_incoming_msg_id,
+                pending_reply_text,
+                pending_reply_created_utc
             FROM thread_state
             WHERE thread_url = ?
             """,
@@ -144,6 +157,9 @@ class StateStore:
                 last_attempt_utc=None,
                 attempt_count=0,
                 last_attempt_incoming_msg_id=None,
+                pending_reply_incoming_msg_id=None,
+                pending_reply_text=None,
+                pending_reply_created_utc=None,
             )
 
         return ThreadState(
@@ -160,6 +176,9 @@ class StateStore:
             last_attempt_utc=row["last_attempt_utc"],
             attempt_count=int(row["attempt_count"] or 0),
             last_attempt_incoming_msg_id=(int(row["last_attempt_incoming_msg_id"]) if row["last_attempt_incoming_msg_id"] is not None else None),
+            pending_reply_incoming_msg_id=(int(row["pending_reply_incoming_msg_id"]) if row["pending_reply_incoming_msg_id"] is not None else None),
+            pending_reply_text=row["pending_reply_text"],
+            pending_reply_created_utc=row["pending_reply_created_utc"],
         )
 
     def upsert_thread_state(
@@ -177,6 +196,9 @@ class StateStore:
         last_attempt_utc: str | None = None,
         last_attempt_incoming_msg_id: int | None | object = _UNSET,
         attempt_count: int | None = None,
+        pending_reply_incoming_msg_id: int | None | object = _UNSET,
+        pending_reply_text: str | None | object = _UNSET,
+        pending_reply_created_utc: str | None | object = _UNSET,
     ) -> None:
         # Keep some fields stable unless explicitly set.
         current_state = self.get_thread_state(thread_url)
@@ -188,6 +210,14 @@ class StateStore:
             last_replied_incoming_msg_id = current_state.last_replied_incoming_msg_id
         if last_attempt_incoming_msg_id is _UNSET:
             last_attempt_incoming_msg_id = current_state.last_attempt_incoming_msg_id
+
+        # Preserve pending reply unless explicitly provided.
+        if pending_reply_incoming_msg_id is _UNSET:
+            pending_reply_incoming_msg_id = current_state.pending_reply_incoming_msg_id
+        if pending_reply_text is _UNSET:
+            pending_reply_text = current_state.pending_reply_text
+        if pending_reply_created_utc is _UNSET:
+            pending_reply_created_utc = current_state.pending_reply_created_utc
         self.conn.execute(
             """
             INSERT INTO thread_state (
@@ -203,9 +233,12 @@ class StateStore:
                 last_attempt_incoming_fingerprint,
                 last_attempt_utc,
                 attempt_count,
-                last_attempt_incoming_msg_id
+                last_attempt_incoming_msg_id,
+                pending_reply_incoming_msg_id,
+                pending_reply_text,
+                pending_reply_created_utc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_url) DO UPDATE SET
                 last_seen_fingerprint = excluded.last_seen_fingerprint,
                 last_seen_text = excluded.last_seen_text,
@@ -219,6 +252,9 @@ class StateStore:
                 last_attempt_utc = excluded.last_attempt_utc,
                 attempt_count = excluded.attempt_count,
                 last_attempt_incoming_msg_id = excluded.last_attempt_incoming_msg_id,
+                pending_reply_incoming_msg_id = excluded.pending_reply_incoming_msg_id,
+                pending_reply_text = excluded.pending_reply_text,
+                pending_reply_created_utc = excluded.pending_reply_created_utc,
                 updated_at_utc = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             """,
             (
@@ -235,6 +271,9 @@ class StateStore:
                 last_attempt_utc,
                 attempt_count,
                 last_attempt_incoming_msg_id,
+                pending_reply_incoming_msg_id,
+                pending_reply_text,
+                pending_reply_created_utc,
             ),
         )
         self.conn.commit()
