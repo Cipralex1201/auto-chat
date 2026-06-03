@@ -152,6 +152,7 @@ class BotScheduler:
 
         for snap in snapshots:
             state = self.store.get_thread_state(snap.thread_url)
+            snap_in_fp = (getattr(snap, "latest_incoming_fingerprint", None) or "").strip() or None
 
             # Persist tail window into message history (idempotent overlap update).
             try:
@@ -211,6 +212,17 @@ class BotScheduler:
 
             incoming_msg_id = int(latest_in.id)
             incoming_text = (latest_in.text or "").strip()
+
+            # Primary reply idempotency key: snapshot incoming fingerprint.
+            # This stays stable even if the same inbound gets inserted twice into history
+            # due to DOM/extraction overlap drift (different DB ids).
+            if snap_in_fp and state.last_replied_incoming_fingerprint == snap_in_fp:
+                LOGGER.debug(
+                    "Incoming already replied-to (fingerprint=%s); no reply (thread=%s)",
+                    snap_in_fp,
+                    snap.thread_url,
+                )
+                continue
 
             if self._is_ignored_exact_text(incoming_text):
                 LOGGER.info(
@@ -356,7 +368,13 @@ class BotScheduler:
                     continue
 
             # Attempt backoff / attempt limit per inbound.
-            if state.last_attempt_incoming_msg_id == incoming_msg_id:
+            same_inbound_for_attempts = False
+            if snap_in_fp and state.last_attempt_incoming_fingerprint == snap_in_fp:
+                same_inbound_for_attempts = True
+            elif state.last_attempt_incoming_msg_id == incoming_msg_id:
+                same_inbound_for_attempts = True
+
+            if same_inbound_for_attempts:
                 last_attempt_dt = parse_iso(state.last_attempt_utc)
                 if state.attempt_count >= max_attempts_per_inbound:
                     LOGGER.warning(
@@ -390,7 +408,7 @@ class BotScheduler:
                 continue
 
             # Record attempt before sleeping/sending to reduce chance of rapid duplicates.
-            attempt_count = state.attempt_count + 1 if state.last_attempt_incoming_msg_id == incoming_msg_id else 1
+            attempt_count = state.attempt_count + 1 if same_inbound_for_attempts else 1
 
             # If a new inbound arrives, drop any stale pending reply from the previous inbound.
             clear_pending = (
@@ -410,7 +428,7 @@ class BotScheduler:
                 last_replied_incoming_fingerprint=state.last_replied_incoming_fingerprint,
                 last_replied_incoming_text=state.last_replied_incoming_text,
                 last_reply_utc=state.last_reply_utc,
-                last_attempt_incoming_fingerprint=getattr(snap, "latest_incoming_fingerprint", None),
+                last_attempt_incoming_fingerprint=snap_in_fp,
                 last_attempt_utc=now_utc_iso(),
                 last_attempt_incoming_msg_id=incoming_msg_id,
                 attempt_count=attempt_count,

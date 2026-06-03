@@ -8,13 +8,16 @@ from state_store import ThreadMessage, ThreadState
 
 
 class _DummyStore:
-    def __init__(self, *, latest_in: ThreadMessage | None = None):
+    def __init__(self, *, latest_in: ThreadMessage | None = None, thread_state: ThreadState | None = None):
         self.latest_in = latest_in
         self.latest_out = None
+        self.thread_state = thread_state
         self.update_tail_calls: list[list[tuple[str, str]]] = []
         self.upserts: list[dict] = []
 
     def get_thread_state(self, thread_url: str) -> ThreadState:
+        if self.thread_state is not None:
+            return self.thread_state
         return ThreadState(
             thread_url=thread_url,
             last_seen_fingerprint=None,
@@ -55,7 +58,7 @@ class _DummyStore:
 
 
 class CaptionIgnoreTests(unittest.TestCase):
-    def _make_scheduler(self, store: _DummyStore) -> BotScheduler:
+    def _make_scheduler(self, store: _DummyStore, *, skip_reply_probability: float = 1.0) -> BotScheduler:
         settings = SimpleNamespace(
             # Minimal settings used by _handle_snapshots
             llm_history_n=10,
@@ -63,7 +66,7 @@ class CaptionIgnoreTests(unittest.TestCase):
             ig_username="myuser",
             dry_run_reply_text="I received your message.",
             enable_sending=False,
-            skip_reply_probability=1.0,
+            skip_reply_probability=float(skip_reply_probability),
             ig_ignore_exact_username="target_handle",
             ig_ignore_exact_fullname="Target Full Name",
         )
@@ -116,6 +119,56 @@ class CaptionIgnoreTests(unittest.TestCase):
             latest_outgoing_text=None,
             tail_messages=[],
             observed_at_utc="2026-05-26T00:00:00+00:00",
+        )
+
+        with patch("scheduler.generate_reply", side_effect=AssertionError("LLM should not be called")):
+            sched._handle_snapshots(driver=None, snapshots=[snap])
+
+    def test_replied_fingerprint_never_triggers_llm_even_if_db_id_differs(self):
+        latest_in = ThreadMessage(
+            id=999,
+            thread_url="https://example.test/direct/t/1/",
+            direction="incoming",
+            text="hello",
+            observed_at_utc="2026-05-26T00:00:00+00:00",
+        )
+
+        replied_fp = "in:aaaa"
+        store = _DummyStore(
+            latest_in=latest_in,
+            thread_state=ThreadState(
+                thread_url=latest_in.thread_url,
+                last_seen_fingerprint=None,
+                last_seen_text=None,
+                last_activity_utc=None,
+                first_reply_sent=1,
+                last_replied_incoming_fingerprint=replied_fp,
+                last_replied_incoming_text="hello",
+                last_reply_utc="2026-05-26T00:00:10+00:00",
+                last_replied_incoming_msg_id=123,
+                last_attempt_incoming_fingerprint=None,
+                last_attempt_utc=None,
+                attempt_count=0,
+                last_attempt_incoming_msg_id=None,
+                pending_reply_incoming_msg_id=None,
+                pending_reply_text=None,
+                pending_reply_created_utc=None,
+            ),
+        )
+
+        # If fingerprint dedupe fails, we'd otherwise generate a reply (skip prob = 0).
+        sched = self._make_scheduler(store, skip_reply_probability=0.0)
+
+        snap = ThreadSnapshot(
+            thread_url=latest_in.thread_url,
+            message_fingerprint="win:1234",
+            message_text="hello",
+            latest_direction="incoming",
+            latest_incoming_fingerprint=replied_fp,
+            latest_incoming_text="hello",
+            latest_outgoing_text=None,
+            tail_messages=[("incoming", "hello")],
+            observed_at_utc="2026-05-26T00:00:12+00:00",
         )
 
         with patch("scheduler.generate_reply", side_effect=AssertionError("LLM should not be called")):

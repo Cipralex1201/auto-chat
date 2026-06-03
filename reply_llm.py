@@ -128,7 +128,7 @@ def _format_message_content(msg: ThreadMessage) -> str:
 
 def _to_chat_messages(history: list[ThreadMessage], *, own_username: str | None = None) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
-    seen_assistant_long: set[str] = set()
+    seen_assistant: set[str] = set()
     seen_user_short: set[str] = set()
     own_u = (own_username or "").strip().lstrip("@").lower()
     for msg in history:
@@ -161,12 +161,12 @@ def _to_chat_messages(history: list[ThreadMessage], *, own_username: str | None 
                     continue
                 seen_user_short.add(content)
 
-        # If DB history is already polluted with duplicated outgoing replies, keep only the
-        # first occurrence of long assistant messages to avoid confusing the model.
-        if role == "assistant" and len(content) >= 20:
-            if content in seen_assistant_long:
+        # If DB history is polluted with duplicated outgoing replies, keep only the first
+        # occurrence (including short ones) to avoid confusing the model.
+        if role == "assistant":
+            if content in seen_assistant:
                 continue
-            seen_assistant_long.add(content)
+            seen_assistant.add(content)
 
         out.append({"role": role, "content": content})
     return out

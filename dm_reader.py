@@ -483,6 +483,13 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
             composer_rect = best
             break
 
+    main_rect: dict | None = None
+    try:
+        main = driver.find_element(By.XPATH, MAIN_CONTAINER_XPATH)
+        main_rect = main.rect
+    except Exception:  # noqa: BLE001
+        main_rect = None
+
     if composer_rect is not None:
         cx = float(composer_rect.get("x", 0.0))
         cw = float(composer_rect.get("width", 0.0))
@@ -492,23 +499,43 @@ def _extract_tail_window(driver, window_size: int = 8) -> tuple[str, list[tuple[
         x_filter_min = cx - 80.0
         x_filter_max = cx + cw + 250.0
     else:
-        try:
-            main = driver.find_element(By.XPATH, MAIN_CONTAINER_XPATH)
-            main_rect = main.rect
-            pane_mid_x = float(main_rect.get("x", 0.0)) + float(main_rect.get("width", 0.0)) / 2.0
-        except Exception:  # noqa: BLE001
+        # Fallback: keep extraction constrained to the right-side conversation pane.
+        # This is critical when the composer is temporarily missing during DOM churn
+        # (common in headless runs) because broad fallback XPaths otherwise capture
+        # left-sidebar thread previews as "messages".
+        if main_rect is not None:
+            mx = float(main_rect.get("x", 0.0))
+            mw = float(main_rect.get("width", 0.0))
+            pane_mid_x = mx + mw / 2.0
+
+            if mw <= 700.0:
+                # Narrow/mobile-ish layout: the sidebar is usually collapsed.
+                x_filter_min = mx - 40.0
+            else:
+                # Desktop layout: ignore the left portion that typically contains the thread list.
+                left_exclusion = min(350.0, mw * 0.25)
+                x_filter_min = mx + left_exclusion
+
+            x_filter_max = mx + mw + 20.0
+        else:
             pane_mid_x = 0.0
+            # Final fallback: avoid far-left sidebar by using a conservative absolute cutoff.
+            x_filter_min = 350.0
+            x_filter_max = None
 
     row_xpath = f"{MAIN_CONTAINER_XPATH}//*[@role='row']"
     listitem_xpath = f"{MAIN_CONTAINER_XPATH}//*[@role='listitem']"
+    # Exclude likely sidebar/navigation containers; these often contain thread previews.
+    _NAV_EXCLUDE = " and not(ancestor::nav) and not(ancestor::aside) and not(ancestor::*[@role='navigation'])"
+
     bubble_xpath = (
-        ".//*[@dir='auto' or @dir='ltr'][normalize-space() and not(ancestor::*[@role='textbox'])]"
-        " | .//span[normalize-space() and not(ancestor::*[@role='textbox'])]"
+        ".//*[@dir='auto' or @dir='ltr'][normalize-space() and not(ancestor::*[@role='textbox'])" + _NAV_EXCLUDE + "]"
+        " | .//span[normalize-space() and not(ancestor::*[@role='textbox'])" + _NAV_EXCLUDE + "]"
     )
     fallback_xpaths = [
-        f"{MAIN_CONTAINER_XPATH}//*[@dir='auto' and normalize-space() and not(ancestor::*[@role='textbox'])]",
-        f"{MAIN_CONTAINER_XPATH}//*[@dir='ltr' and normalize-space() and not(ancestor::*[@role='textbox'])]",
-        f"{MAIN_CONTAINER_XPATH}//span[normalize-space() and not(ancestor::*[@role='textbox'])]",
+        f"{MAIN_CONTAINER_XPATH}//*[@dir='auto' and normalize-space() and not(ancestor::*[@role='textbox']){_NAV_EXCLUDE}]",
+        f"{MAIN_CONTAINER_XPATH}//*[@dir='ltr' and normalize-space() and not(ancestor::*[@role='textbox']){_NAV_EXCLUDE}]",
+        f"{MAIN_CONTAINER_XPATH}//span[normalize-space() and not(ancestor::*[@role='textbox']){_NAV_EXCLUDE}]",
     ]
 
     raw: list[tuple[str, str, float]] = []
